@@ -21,7 +21,7 @@ const HELP_TEXT = `
 Usage: ccr [command]
 
 Commands:
-  start         Start server 
+  start         Start server
   stop          Stop server
   restart       Restart server
   status        Show server status
@@ -29,6 +29,7 @@ Commands:
   code          Execute claude command
   model         Interactive model selection and configuration
   ui            Open the web UI in browser
+  metrics       Show real-time metrics dashboard
   -v, version   Show version information
   -h, help      Show help information
 
@@ -37,6 +38,7 @@ Example:
   ccr code "Write a Hello World"
   ccr model
   ccr ui
+  ccr metrics
 `;
 
 async function waitForService(
@@ -273,6 +275,62 @@ async function main() {
       }
 
       exec(openCommand, (error) => {
+        if (error) {
+          console.error("Failed to open browser:", error.message);
+          process.exit(1);
+        }
+      });
+      break;
+    case "metrics":
+      // Check if service is running
+      if (!isRunning) {
+        console.log("Service not running, starting service...");
+        const cliPath = join(__dirname, "cli.js");
+        const startProcess = spawn("node", [cliPath, "start"], {
+          detached: true,
+          stdio: "ignore",
+        });
+
+        startProcess.on("error", (error) => {
+          console.error("Failed to start service:", error.message);
+          process.exit(1);
+        });
+
+        startProcess.unref();
+
+        if (!(await waitForService())) {
+          console.error(
+            "Service startup timeout, please manually run `ccr start` to start the service"
+          );
+          process.exit(1);
+        }
+      }
+
+      // Get service info and open metrics dashboard
+      const metricsServiceInfo = await getServiceInfo();
+      const metricsUrl = `${metricsServiceInfo.endpoint}/ui/#/metrics`;
+
+      console.log(`Opening metrics dashboard at ${metricsUrl}`);
+
+      // Open URL in browser based on platform
+      const metricsPlatform = process.platform;
+      let metricsOpenCommand = "";
+
+      if (metricsPlatform === "win32") {
+        // Windows
+        metricsOpenCommand = `start ${metricsUrl}`;
+      } else if (metricsPlatform === "darwin") {
+        // macOS
+        metricsOpenCommand = `open ${metricsUrl}`;
+      } else if (metricsPlatform === "linux") {
+        // Linux
+        metricsOpenCommand = `xdg-open ${metricsUrl}`;
+      } else {
+        console.error("Unsupported platform for opening browser");
+        process.exit(1);
+      }
+
+      exec(metricsOpenCommand, (error) => {
         if (error) {
           console.error("Failed to open browser:", error.message);
           process.exit(1);

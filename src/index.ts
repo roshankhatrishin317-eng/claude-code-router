@@ -22,6 +22,7 @@ import JSON5 from "json5";
 import { IAgent } from "./agents/type";
 import agentsManager from "./agents";
 import { EventEmitter } from "node:events";
+import { metricsCollector, RequestMetrics } from "./utils/metrics";
 
 const event = new EventEmitter()
 
@@ -159,6 +160,10 @@ async function run(options: RunOptions = {}) {
   });
   server.addHook("preHandler", async (req, reply) => {
     if (req.url.startsWith("/v1/messages") && !req.url.startsWith("/v1/messages/count_tokens")) {
+      // Start timing for metrics
+      const requestStartTime = Date.now();
+      req.requestStartTime = requestStartTime;
+
       const useAgents = []
 
       for (const agent of agentsManager.getAllAgents()) {
@@ -196,6 +201,35 @@ async function run(options: RunOptions = {}) {
   });
   server.addHook("onError", async (request, reply, error) => {
     event.emit('onError', request, reply, error);
+
+    // Record metrics for failed requests
+    if (request.requestStartTime && request.url.startsWith("/v1/messages") && !request.url.startsWith("/v1/messages/count_tokens")) {
+      // Extract provider and model from request
+      let provider = 'unknown';
+      let model = 'unknown';
+
+      if (request.body?.model) {
+        if (typeof request.body.model === 'string' && request.body.model.includes(',')) {
+          [provider, model] = request.body.model.split(',');
+        } else {
+          model = request.body.model;
+        }
+      }
+
+      const metrics: RequestMetrics = {
+        timestamp: request.requestStartTime,
+        sessionId: request.sessionId,
+        provider,
+        model,
+        inputTokens: 0,
+        outputTokens: 0,
+        duration: Date.now() - request.requestStartTime,
+        success: false,
+        errorType: error.name || 'unknown'
+      };
+
+      metricsCollector.recordRequest(metrics);
+    }
   })
   server.addHook("onSend", (req, reply, payload, done) => {
     if (req.sessionId && req.url.startsWith("/v1/messages") && !req.url.startsWith("/v1/messages/count_tokens")) {
@@ -358,6 +392,52 @@ async function run(options: RunOptions = {}) {
         return done(null, originalStream)
       }
       sessionUsageCache.put(req.sessionId, payload.usage);
+
+      // Record metrics for successful responses
+      if (req.requestStartTime && req.url.startsWith("/v1/messages") && !req.url.startsWith("/v1/messages/count_tokens")) {
+        let inputTokens = 0;
+        let outputTokens = 0;
+        let success = true;
+        let errorType = undefined;
+
+        if (payload && typeof payload === 'object') {
+          if (payload.usage) {
+            inputTokens = payload.usage.input_tokens || 0;
+            outputTokens = payload.usage.output_tokens || 0;
+          }
+          if (payload.error) {
+            success = false;
+            errorType = payload.error.type || 'unknown';
+          }
+        }
+
+        // Extract provider and model from request
+        let provider = 'unknown';
+        let model = 'unknown';
+
+        if (req.body?.model) {
+          if (typeof req.body.model === 'string' && req.body.model.includes(',')) {
+            [provider, model] = req.body.model.split(',');
+          } else {
+            model = req.body.model;
+          }
+        }
+
+        const metrics: RequestMetrics = {
+          timestamp: req.requestStartTime,
+          sessionId: req.sessionId,
+          provider,
+          model,
+          inputTokens,
+          outputTokens,
+          duration: Date.now() - req.requestStartTime,
+          success,
+          errorType
+        };
+
+        metricsCollector.recordRequest(metrics);
+      }
+
       if (typeof payload ==='object') {
         if (payload.error) {
           return done(payload.error, null)

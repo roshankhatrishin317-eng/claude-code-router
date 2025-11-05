@@ -10,7 +10,7 @@ import { LogViewer } from "@/components/LogViewer";
 import { Button } from "@/components/ui/button";
 import { useConfig } from "@/components/ConfigProvider";
 import { api } from "@/lib/api";
-import { Settings, Languages, Save, RefreshCw, FileJson, CircleArrowUp, FileText } from "lucide-react";
+import { Settings, Languages, Save, RefreshCw, FileJson, CircleArrowUp, FileText, BarChart3 } from "lucide-react";
 import {
   Popover,
   PopoverContent,
@@ -280,6 +280,9 @@ function App() {
           </Button>
           <Button variant="ghost" size="icon" onClick={() => setIsLogViewerOpen(true)} className="transition-all-ease hover:scale-110">
             <FileText className="h-5 w-5" />
+          </Button>
+          <Button variant="ghost" size="icon" onClick={() => navigate('/metrics')} className="transition-all-ease hover:scale-110">
+            <BarChart3 className="h-5 w-5" />
           </Button>
           <Popover>
             <PopoverTrigger asChild>

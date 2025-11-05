@@ -6,6 +6,7 @@ import fastifyStatic from "@fastify/static";
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync } from "fs";
 import { homedir } from "os";
 import {calculateTokenCount} from "./utils/router";
+import { metricsCollector } from "./utils/metrics";
 
 export const createServer = (config: any): Server => {
   const server = new Server(config);
@@ -195,6 +196,109 @@ export const createServer = (config: any): Server => {
     } catch (error) {
       console.error("Failed to clear logs:", error);
       reply.status(500).send({ error: "Failed to clear logs" });
+    }
+  });
+
+  // Add metrics API endpoints
+  server.app.get("/api/metrics/realtime", async (req, reply) => {
+    try {
+      return metricsCollector.getRealTimeMetrics();
+    } catch (error) {
+      console.error("Failed to get realtime metrics:", error);
+      reply.status(500).send({ error: "Failed to get realtime metrics" });
+    }
+  });
+
+  server.app.get("/api/metrics/providers", async (req, reply) => {
+    try {
+      return metricsCollector.getProviderMetrics();
+    } catch (error) {
+      console.error("Failed to get provider metrics:", error);
+      reply.status(500).send({ error: "Failed to get provider metrics" });
+    }
+  });
+
+  server.app.get("/api/metrics/sessions", async (req, reply) => {
+    try {
+      return metricsCollector.getSessionMetrics();
+    } catch (error) {
+      console.error("Failed to get session metrics:", error);
+      reply.status(500).send({ error: "Failed to get session metrics" });
+    }
+  });
+
+  server.app.get("/api/metrics/history", async (req, reply) => {
+    try {
+      const limit = parseInt((req.query as any).limit) || 100;
+      return metricsCollector.getHistoricalRequests(limit);
+    } catch (error) {
+      console.error("Failed to get metrics history:", error);
+      reply.status(500).send({ error: "Failed to get metrics history" });
+    }
+  });
+
+  server.app.get("/api/metrics/summary", async (req, reply) => {
+    try {
+      return metricsCollector.getMetricsSummary();
+    } catch (error) {
+      console.error("Failed to get metrics summary:", error);
+      reply.status(500).send({ error: "Failed to get metrics summary" });
+    }
+  });
+
+  server.app.get("/api/metrics/tokens", async (req, reply) => {
+    try {
+      return metricsCollector.getTokenAnalytics();
+    } catch (error) {
+      console.error("Failed to get token analytics:", error);
+      reply.status(500).send({ error: "Failed to get token analytics" });
+    }
+  });
+
+  // Server-Sent Events endpoint for real-time metrics
+  server.app.get("/api/metrics/stream", async (req, reply) => {
+    try {
+      reply.raw.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*'
+      });
+
+      // Send initial data
+      const initialData = metricsCollector.getRealTimeMetrics();
+      reply.raw.write(`data: ${JSON.stringify(initialData)}\n\n`);
+
+      // Subscribe to metrics updates
+      const onMetricsUpdate = (metrics: any) => {
+        reply.raw.write(`data: ${JSON.stringify(metrics)}\n\n`);
+      };
+
+      metricsCollector.on('metricsUpdated', onMetricsUpdate);
+
+      // Clean up on disconnect
+      req.raw.on('close', () => {
+        metricsCollector.removeListener('metricsUpdated', onMetricsUpdate);
+      });
+
+      // Send periodic updates every second
+      const interval = setInterval(() => {
+        try {
+          const metrics = metricsCollector.getRealTimeMetrics();
+          reply.raw.write(`data: ${JSON.stringify(metrics)}\n\n`);
+        } catch (error) {
+          clearInterval(interval);
+          metricsCollector.removeListener('metricsUpdated', onMetricsUpdate);
+        }
+      }, 1000);
+
+      req.raw.on('close', () => {
+        clearInterval(interval);
+      });
+
+    } catch (error) {
+      console.error("Failed to setup metrics stream:", error);
+      reply.status(500).send({ error: "Failed to setup metrics stream" });
     }
   });
 
