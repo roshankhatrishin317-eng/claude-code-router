@@ -7,6 +7,16 @@
   "APIKEY": "",
   "API_TIMEOUT_MS": "600000",
   "PROXY_URL": "",
+  "Cache": {
+    "enabled": false,
+    "levels": {
+      "memory": {
+        "enabled": true,
+        "maxSize": 1000,
+        "ttl": 3600000
+      }
+    }
+  },
   "transformers": [],
 
   // ===== ENHANCED MONITORING (Simple Setup) =====

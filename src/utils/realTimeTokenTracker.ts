@@ -18,10 +18,11 @@ export class RealTimeTokenTracker {
   private readonly HISTORY_WINDOW = 2000; // 2 seconds window for smoothing
   private readonly CLEANUP_INTERVAL = 5000; // Cleanup every 5 seconds
   private readonly MAX_HISTORY_SIZE = 2000; // Keep last 2000 data points
+  private cleanupInterval?: NodeJS.Timeout;
 
   private constructor() {
     // Clean up old data periodically
-    setInterval(() => this.cleanup(), this.CLEANUP_INTERVAL);
+    this.cleanupInterval = setInterval(() => this.cleanup(), this.CLEANUP_INTERVAL);
   }
 
   static getInstance(): RealTimeTokenTracker {
@@ -66,6 +67,10 @@ export class RealTimeTokenTracker {
       data.timestamp >= oneSecondAgo
     );
 
+    if (recentData.length === 0) {
+      return { inputTPS: 0, outputTPS: 0 };
+    }
+
     // Calculate TPS with smoothing
     let totalInputTPS = 0;
     let totalOutputTPS = 0;
@@ -77,17 +82,18 @@ export class RealTimeTokenTracker {
 
     // Enhanced smoothing using weighted average
     const weights = this.calculateWeights(recentData, oneSecondAgo);
-    if (weights.length > 0) {
+    if (weights.length > 0 && weights.length === recentData.length) {
       let weightedInputTPS = 0;
       let weightedOutputTPS = 0;
       let totalWeight = 0;
 
-      for (let i = 0; i < recentData.length && i < weights.length; i++) {
+      for (let i = 0; i < recentData.length; i++) {
         weightedInputTPS += recentData[i].inputTokens * weights[i];
         weightedOutputTPS += recentData[i].outputTokens * weights[i];
         totalWeight += weights[i];
       }
 
+      // Prevent division by zero
       if (totalWeight > 0) {
         totalInputTPS = weightedInputTPS / totalWeight;
         totalOutputTPS = weightedOutputTPS / totalWeight;
@@ -208,6 +214,18 @@ export class RealTimeTokenTracker {
       totalInputTokens: recentData.reduce((sum, data) => sum + data.inputTokens, 0),
       totalOutputTokens: recentData.reduce((sum, data) => sum + data.outputTokens, 0)
     };
+  }
+
+  /**
+   * Cleanup method to clear intervals and prevent memory leaks
+   */
+  destroy(): void {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = undefined;
+    }
+    this.tokenBuffers.clear();
+    this.tokenHistory = [];
   }
 }
 

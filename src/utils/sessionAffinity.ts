@@ -33,6 +33,7 @@ export interface SessionMetrics {
   stickySessions: number;
   averageRequestsPerSession: number;
   topSessionsByActivity: SessionInfo[];
+  timestamp?: number;
 }
 
 class SessionAffinityManager extends EventEmitter {
@@ -217,7 +218,11 @@ class SessionAffinityManager extends EventEmitter {
     if (!session) return;
 
     // Update latency (running average)
-    session.averageLatency = (session.averageLatency * (session.requestCount - 1) + latency) / session.requestCount;
+    if (session.requestCount > 0) {
+      session.averageLatency = (session.averageLatency * (session.requestCount - 1) + latency) / session.requestCount;
+    } else {
+      session.averageLatency = latency;
+    }
 
     // Update token count
     session.totalTokens += tokens;

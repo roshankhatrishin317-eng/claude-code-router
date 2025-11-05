@@ -394,6 +394,14 @@ interface RateLimitBucket {
 export const authManager = new AuthManager();
 
 // Cleanup expired tokens every hour
-setInterval(() => {
+let authCleanupInterval: NodeJS.Timeout | undefined = setInterval(() => {
   authManager.cleanup();
 }, 60 * 60 * 1000);
+
+// Cleanup function for auth manager
+export function cleanupAuthManagerInterval(): void {
+  if (authCleanupInterval) {
+    clearInterval(authCleanupInterval);
+    authCleanupInterval = undefined;
+  }
+}

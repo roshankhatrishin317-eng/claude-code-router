@@ -72,11 +72,12 @@ export class PrometheusExporter {
 
     // System health metrics
     const healthStatus = systemHealthMonitor.getHealthStatus();
+    const systemHealth = systemHealthMonitor.getSystemHealth();
     this.addGauge('ccr_system_health_score', 'System health score (0-100)', healthStatus.score);
-    this.addGauge('ccr_cpu_usage_percent', 'CPU usage percentage', healthStatus.cpuUsage);
-    this.addGauge('ccr_memory_usage_percent', 'Memory usage percentage', healthStatus.memoryUsage);
-    this.addGauge('ccr_heap_usage_percent', 'Heap usage percentage', healthStatus.heapUsage);
-    this.addGauge('ccr_event_loop_delay_ms', 'Event loop delay in milliseconds', healthStatus.eventLoopDelay);
+    this.addGauge('ccr_cpu_usage_percent', 'CPU usage percentage', systemHealth.cpu.usage);
+    this.addGauge('ccr_memory_usage_percent', 'Memory usage percentage', systemHealth.memory.usagePercent);
+    this.addGauge('ccr_heap_usage_percent', 'Heap usage percentage', systemHealth.heap.usagePercent);
+    this.addGauge('ccr_event_loop_delay_ms', 'Event loop delay in milliseconds', systemHealth.eventLoop.delay);
 
     // Circuit breaker metrics
     const cbStatuses = circuitBreakerManager.getAllStatuses();
@@ -236,6 +237,7 @@ export class PrometheusExporter {
   generateOpenTelemetryMetrics(): any {
     const realTimeMetrics = metricsCollector.getRealTimeMetrics();
     const healthStatus = systemHealthMonitor.getHealthStatus();
+    const systemHealth = systemHealthMonitor.getSystemHealth();
 
     return {
       resource_metrics: [{
@@ -324,7 +326,7 @@ export class PrometheusExporter {
               unit: '1',
               gauge: {
                 dataPoints: [{
-                  value: healthStatus.cpuUsage / 100,
+                  value: systemHealth.cpu.usage / 100,
                   timeUnixNano: Date.now() * 1000000
                 }]
               }

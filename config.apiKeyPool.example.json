@@ -1,0 +1,85 @@
+{
+  "ApiKeyPool": {
+    "enabled": true,
+    "strategy": "least-loaded",
+    "healthCheckInterval": 60000,
+    "providers": {
+      "anthropic": {
+        "keys": [
+          {
+            "key": "sk-ant-api03-key1-example",
+            "rateLimit": {
+              "requestsPerMinute": 50,
+              "tokensPerMinute": 40000,
+              "requestsPerDay": 5000
+            },
+            "priority": 10,
+            "enabled": true,
+            "tags": ["production", "high-priority"]
+          },
+          {
+            "key": "sk-ant-api03-key2-example",
+            "rateLimit": {
+              "requestsPerMinute": 50,
+              "tokensPerMinute": 40000,
+              "requestsPerDay": 5000
+            },
+            "priority": 10,
+            "enabled": true,
+            "tags": ["production"]
+          },
+          {
+            "key": "sk-ant-api03-key3-example",
+            "rateLimit": {
+              "requestsPerMinute": 50,
+              "tokensPerMinute": 40000,
+              "requestsPerDay": 5000
+            },
+            "priority": 5,
+            "enabled": true,
+            "tags": ["backup"]
+          }
+        ]
+      },
+      "openai": {
+        "keys": [
+          {
+            "key": "sk-proj-key1-example",
+            "rateLimit": {
+              "requestsPerMinute": 60,
+              "tokensPerMinute": 90000
+            },
+            "priority": 10,
+            "enabled": true,
+            "tags": ["production"]
+          },
+          {
+            "key": "sk-proj-key2-example",
+            "rateLimit": {
+              "requestsPerMinute": 60,
+              "tokensPerMinute": 90000
+            },
+            "priority": 10,
+            "enabled": true,
+            "tags": ["production"]
+          }
+        ]
+      },
+      "google": {
+        "keys": [
+          {
+            "key": "AIzaSy-key1-example",
+            "rateLimit": {
+              "requestsPerMinute": 100,
+              "tokensPerMinute": 100000
+            },
+            "priority": 10,
+            "enabled": true,
+            "tags": ["production"]
+          }
+        ]
+      }
+    }
+  },
+  "Comment": "This is an example configuration for the API Key Pool system. Strategies available: round-robin, lru, least-loaded, weighted"
+}

@@ -138,6 +138,9 @@ export class MetricsCollector extends EventEmitter {
   private readonly ONE_SECOND = 1000;
   private readonly BATCH_SIZE = 100;
   private readonly BATCH_TIMEOUT = 5000; // 5 seconds
+  private cleanupInterval?: NodeJS.Timeout;
+  private batchFlushInterval?: NodeJS.Timeout;
+  private dbCleanupInterval?: NodeJS.Timeout;
 
   // Default token costs (can be overridden per provider/model)
   private tokenCosts: Map<string, TokenCosts> = new Map([
@@ -163,13 +166,13 @@ export class MetricsCollector extends EventEmitter {
   constructor() {
     super();
     // Clean up old data every minute
-    setInterval(() => this.cleanupOldData(), 60 * 1000);
+    this.cleanupInterval = setInterval(() => this.cleanupOldData(), 60 * 1000);
 
     // Start batch persistence
-    setInterval(() => this.flushBatch(), this.BATCH_TIMEOUT);
+    this.batchFlushInterval = setInterval(() => this.flushBatch(), this.BATCH_TIMEOUT);
 
     // Cleanup database every hour
-    setInterval(() => {
+    this.dbCleanupInterval = setInterval(() => {
       metricsDatabase.cleanupOldData(90); // Keep 90 days of data
     }, 60 * 60 * 1000);
   }
@@ -195,40 +198,59 @@ export class MetricsCollector extends EventEmitter {
   }
 
   recordRequest(metrics: RequestMetrics): void {
-    // Add to history
-    this.requestHistory.push(metrics);
-    if (this.requestHistory.length > this.MAX_HISTORY_SIZE) {
-      this.requestHistory.shift();
+    try {
+      // Validate metrics data
+      if (!metrics || !metrics.timestamp || !metrics.provider || !metrics.model) {
+        console.warn('[METRICS] Invalid metrics data, skipping:', metrics);
+        return;
+      }
+
+      // Add to history
+      this.requestHistory.push(metrics);
+      if (this.requestHistory.length > this.MAX_HISTORY_SIZE) {
+        this.requestHistory.shift();
+      }
+
+      // Update last minute requests
+      this.lastMinuteRequests.push(metrics);
+
+      // Update session metrics
+      this.updateSessionMetrics(metrics);
+
+      // Update provider metrics
+      this.updateProviderMetrics(metrics);
+
+      // Update token rate tracking
+      const totalTokens = metrics.inputTokens + metrics.outputTokens;
+      this.lastSecondTokens.push({
+        tokens: totalTokens,
+        inputTokens: metrics.inputTokens,
+        outputTokens: metrics.outputTokens,
+        timestamp: metrics.timestamp
+      });
+
+      // Update real-time token tracker
+      if (metrics.inputTokens > 0 || metrics.outputTokens > 0) {
+        realTimeTokenTracker.addTokenData(
+          metrics.sessionId || 'unknown',
+          metrics.inputTokens,
+          metrics.outputTokens
+        );
+      }
+
+      // Add to batch for persistence
+      this.pendingPersists.push(metrics);
+
+      // Flush batch if it's full
+      if (this.pendingPersists.length >= this.BATCH_SIZE) {
+        this.flushBatch();
+      }
+
+      // Emit event for real-time updates
+      this.emit('metricsUpdated', this.getRealTimeMetrics());
+    } catch (error) {
+      console.error('[METRICS] Error recording request metrics:', error);
     }
-
-    // Update last minute requests
-    this.lastMinuteRequests.push(metrics);
-
-    // Update session metrics
-    this.updateSessionMetrics(metrics);
-
-    // Update provider metrics
-    this.updateProviderMetrics(metrics);
-
-    // Update token rate tracking
-    const totalTokens = metrics.inputTokens + metrics.outputTokens;
-    this.lastSecondTokens.push({
-      tokens: totalTokens,
-      inputTokens: metrics.inputTokens,
-      outputTokens: metrics.outputTokens,
-      timestamp: metrics.timestamp
-    });
-
-    // Add to batch for persistence
-    this.pendingPersists.push(metrics);
-
-    // Flush batch if it's full
-    if (this.pendingPersists.length >= this.BATCH_SIZE) {
-      this.flushBatch();
-    }
-
-    // Emit event for real-time updates
-    this.emit('metricsUpdated', this.getRealTimeMetrics());
   }
 
   /**
@@ -237,12 +259,16 @@ export class MetricsCollector extends EventEmitter {
   private flushBatch(): void {
     if (this.pendingPersists.length === 0) return;
 
+    const batchToFlush = [...this.pendingPersists];
+    this.pendingPersists = [];
+
     try {
-      metricsDatabase.insertRequestsBatch(this.pendingPersists);
-      this.pendingPersists = [];
+      metricsDatabase.insertRequestsBatch(batchToFlush);
+      console.log(`[METRICS] Successfully flushed ${batchToFlush.length} metrics to database`);
     } catch (error) {
       console.error('Error persisting metrics to database:', error);
-      // Keep the data in memory for retry
+      // Re-add failed metrics for retry (keep only last batch to prevent memory leak)
+      this.pendingPersists = batchToFlush.slice(-this.BATCH_SIZE);
     }
   }
 
@@ -666,6 +692,27 @@ export class MetricsCollector extends EventEmitter {
     }
 
     return distribution;
+  }
+
+  /**
+   * Cleanup method to clear all intervals and prevent memory leaks
+   */
+  cleanup(): void {
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = undefined;
+    }
+    if (this.batchFlushInterval) {
+      clearInterval(this.batchFlushInterval);
+      this.batchFlushInterval = undefined;
+    }
+    if (this.dbCleanupInterval) {
+      clearInterval(this.dbCleanupInterval);
+      this.dbCleanupInterval = undefined;
+    }
+    
+    // Flush any pending metrics before cleanup
+    this.flushBatch();
   }
 }
 

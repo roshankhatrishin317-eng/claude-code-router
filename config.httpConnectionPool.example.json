@@ -1,0 +1,32 @@
+{
+  "HttpConnectionPool": {
+    "enabled": true,
+    "global": {
+      "maxSockets": 50,
+      "maxFreeSockets": 10,
+      "timeout": 30000,
+      "keepAlive": true,
+      "keepAliveMsecs": 60000,
+      "freeSocketTimeout": 15000,
+      "maxSocketLifetime": 600000
+    },
+    "providers": {
+      "anthropic": {
+        "maxSockets": 20,
+        "maxFreeSockets": 5,
+        "keepAliveMsecs": 120000
+      },
+      "openai": {
+        "maxSockets": 30,
+        "maxFreeSockets": 8,
+        "keepAliveMsecs": 90000
+      },
+      "nvidia": {
+        "maxSockets": 15,
+        "maxFreeSockets": 5,
+        "keepAliveMsecs": 120000
+      }
+    }
+  },
+  "Comment": "HTTP Connection Pool with keep-alive for 30-50% faster requests"
+}

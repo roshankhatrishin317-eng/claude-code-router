@@ -1,0 +1,74 @@
+{
+  "LOG": false,
+  "LOG_LEVEL": "info",
+  "HOST": "127.0.0.1",
+  "PORT": 3456,
+  "APIKEY": "your-api-key-here",
+  
+  "Cache": {
+    "enabled": true,
+    "levels": {
+      "memory": {
+        "enabled": true,
+        "maxSize": 1000,
+        "ttl": 3600000
+      },
+      "redis": {
+        "enabled": false,
+        "url": "redis://localhost:6379",
+        "ttl": 86400000,
+        "password": ""
+      },
+      "disk": {
+        "enabled": false,
+        "path": "/home/user/.claude-code-router/cache",
+        "maxSize": 104857600,
+        "ttl": 86400000
+      }
+    },
+    "strategy": {
+      "hashAlgorithm": "sha256",
+      "ignoreFields": [
+        "metadata.user_id",
+        "metadata.timestamp",
+        "stream"
+      ],
+      "includeFields": [
+        "model",
+        "messages",
+        "temperature",
+        "max_tokens",
+        "top_p",
+        "system",
+        "tools"
+      ],
+      "varyBy": [
+        "metadata.session"
+      ]
+    },
+    "semantic": {
+      "enabled": false,
+      "similarityThreshold": 0.85,
+      "maxComparisons": 50
+    },
+    "invalidation": {
+      "patterns": [],
+      "ttlVariance": 300000
+    }
+  },
+  
+  "Providers": [
+    {
+      "name": "openrouter",
+      "baseURL": "https://openrouter.ai/api/v1",
+      "apiKey": "$OPENROUTER_API_KEY",
+      "models": ["anthropic/claude-3.5-sonnet"]
+    }
+  ],
+  
+  "Router": {
+    "default": "openrouter,anthropic/claude-3.5-sonnet",
+    "longContext": "openrouter,anthropic/claude-3.5-sonnet",
+    "longContextThreshold": 60000
+  }
+}

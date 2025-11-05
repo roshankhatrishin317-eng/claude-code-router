@@ -51,74 +51,81 @@ export class MetricsDatabase {
    * Initialize database schema
    */
   private initializeDatabase(): void {
-    // Create requests table
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS requests (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp INTEGER NOT NULL,
-        session_id TEXT,
-        provider TEXT NOT NULL,
-        model TEXT NOT NULL,
-        input_tokens INTEGER DEFAULT 0,
-        output_tokens INTEGER DEFAULT 0,
-        duration_ms INTEGER NOT NULL,
-        status_code INTEGER,
-        success BOOLEAN NOT NULL,
-        error_type TEXT,
-        ip_address TEXT,
-        user_agent TEXT,
-        first_token_latency INTEGER,
-        streaming_efficiency REAL,
-        cost_usd REAL DEFAULT 0
-      )
-    `);
+    try {
+      // Create requests table
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS requests (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          timestamp INTEGER NOT NULL,
+          session_id TEXT,
+          provider TEXT NOT NULL,
+          model TEXT NOT NULL,
+          input_tokens INTEGER DEFAULT 0,
+          output_tokens INTEGER DEFAULT 0,
+          duration_ms INTEGER NOT NULL,
+          status_code INTEGER,
+          success BOOLEAN NOT NULL,
+          error_type TEXT,
+          ip_address TEXT,
+          user_agent TEXT,
+          first_token_latency INTEGER,
+          streaming_efficiency REAL,
+          cost_usd REAL DEFAULT 0
+        )
+      `);
 
-    // Create indexes for better query performance
-    this.db.exec(`
-      CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
-      CREATE INDEX IF NOT EXISTS idx_requests_provider ON requests(provider);
-      CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model);
-      CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id);
-    `);
+      // Create indexes for better query performance
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_requests_timestamp ON requests(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_requests_provider ON requests(provider);
+        CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model);
+        CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id);
+        CREATE INDEX IF NOT EXISTS idx_requests_success ON requests(success);
+        CREATE INDEX IF NOT EXISTS idx_requests_status_code ON requests(status_code);
+      `);
 
-    // Create aggregated_hourly table for faster historical queries
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS aggregated_hourly (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        hour_timestamp INTEGER NOT NULL,
-        provider TEXT NOT NULL,
-        model TEXT NOT NULL,
-        request_count INTEGER DEFAULT 0,
-        total_input_tokens INTEGER DEFAULT 0,
-        total_output_tokens INTEGER DEFAULT 0,
-        total_duration_ms INTEGER DEFAULT 0,
-        error_count INTEGER DEFAULT 0,
-        total_cost REAL DEFAULT 0,
-        UNIQUE(hour_timestamp, provider, model)
-      )
-    `);
+      // Create aggregated_hourly table for faster historical queries
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS aggregated_hourly (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          hour_timestamp INTEGER NOT NULL,
+          provider TEXT NOT NULL,
+          model TEXT NOT NULL,
+          request_count INTEGER DEFAULT 0,
+          total_input_tokens INTEGER DEFAULT 0,
+          total_output_tokens INTEGER DEFAULT 0,
+          total_duration_ms INTEGER DEFAULT 0,
+          error_count INTEGER DEFAULT 0,
+          total_cost REAL DEFAULT 0,
+          UNIQUE(hour_timestamp, provider, model)
+        )
+      `);
 
-    this.db.exec(`
-      CREATE INDEX IF NOT EXISTS idx_aggregated_hour ON aggregated_hourly(hour_timestamp);
-      CREATE INDEX IF NOT EXISTS idx_aggregated_provider ON aggregated_hourly(provider);
-    `);
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_aggregated_hour ON aggregated_hourly(hour_timestamp);
+        CREATE INDEX IF NOT EXISTS idx_aggregated_provider ON aggregated_hourly(provider);
+      `);
 
-    // Create provider_health table for circuit breaker tracking
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS provider_health (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp INTEGER NOT NULL,
-        provider TEXT NOT NULL,
-        model TEXT,
-        status TEXT NOT NULL,
-        failure_count INTEGER DEFAULT 0,
-        response_time_ms INTEGER,
-        error_message TEXT,
-        UNIQUE(timestamp, provider, model)
-      )
-    `);
+      // Create provider_health table for circuit breaker tracking
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS provider_health (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          timestamp INTEGER NOT NULL,
+          provider TEXT NOT NULL,
+          model TEXT,
+          status TEXT NOT NULL,
+          failure_count INTEGER DEFAULT 0,
+          response_time_ms INTEGER,
+          error_message TEXT,
+          UNIQUE(timestamp, provider, model)
+        )
+      `);
 
-    console.log('Metrics database initialized');
+      console.log('[METRICS-DB] Database initialized successfully at:', this.dbPath);
+    } catch (error) {
+      console.error('[METRICS-DB] Error initializing database:', error);
+      throw error;
+    }
   }
 
   /**
@@ -156,97 +163,116 @@ export class MetricsDatabase {
    * Batch insert request metrics for better performance
    */
   insertRequestsBatch(metricsArray: RequestMetrics[]): void {
-    const stmt = this.db.prepare(`
-      INSERT INTO requests (
-        timestamp, session_id, provider, model, input_tokens, output_tokens,
-        duration_ms, status_code, success, error_type, ip_address,
-        user_agent, first_token_latency, streaming_efficiency, cost_usd
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `);
+    if (!metricsArray || metricsArray.length === 0) {
+      return;
+    }
 
-    const transaction = this.db.transaction((metrics: RequestMetrics[]) => {
-      for (const metrics of metricsArray) {
-        stmt.run(
-          metrics.timestamp,
-          metrics.sessionId,
-          metrics.provider,
-          metrics.model,
-          metrics.inputTokens,
-          metrics.outputTokens,
-          metrics.duration,
-          metrics.statusCode,
-          metrics.success ? 1 : 0,
-          metrics.errorType,
-          metrics.ipAddress,
-          metrics.userAgent,
-          metrics.firstTokenLatency,
-          metrics.streamingEfficiency,
-          this.calculateRequestCost(metrics)
-        );
-      }
-    });
+    try {
+      const stmt = this.db.prepare(`
+        INSERT INTO requests (
+          timestamp, session_id, provider, model, input_tokens, output_tokens,
+          duration_ms, status_code, success, error_type, ip_address,
+          user_agent, first_token_latency, streaming_efficiency, cost_usd
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
 
-    transaction(metricsArray);
+      const transaction = this.db.transaction((metricsArray: RequestMetrics[]) => {
+        for (const metric of metricsArray) {
+          try {
+            stmt.run(
+              metric.timestamp,
+              metric.sessionId || null,
+              metric.provider,
+              metric.model,
+              metric.inputTokens || 0,
+              metric.outputTokens || 0,
+              metric.duration,
+              metric.statusCode || null,
+              metric.success ? 1 : 0,
+              metric.errorType || null,
+              metric.ipAddress || null,
+              metric.userAgent || null,
+              metric.firstTokenLatency || null,
+              metric.streamingEfficiency || null,
+              this.calculateRequestCost(metric)
+            );
+          } catch (insertError) {
+            console.error('Error inserting metric:', insertError, metric);
+            // Continue with other metrics
+          }
+        }
+      });
+
+      transaction(metricsArray);
+    } catch (error) {
+      console.error('Error in batch insert transaction:', error);
+      throw error;
+    }
   }
 
   /**
    * Query historical metrics with filtering and aggregation
    */
   queryHistoricalMetrics(query: HistoricalQuery): AggregatedMetrics[] {
-    let sql = `
-      SELECT
-        datetime(timestamp / 1000, 'unixepoch', 'localtime') as period,
-        COUNT(*) as request_count,
-        SUM(input_tokens) as total_input_tokens,
-        SUM(output_tokens) as total_output_tokens,
-        AVG(duration_ms) as average_latency,
-        SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as error_count,
-        SUM(cost_usd) as total_cost
-      FROM requests
-      WHERE 1=1
-    `;
+    try {
+      let sql = `
+        SELECT
+          datetime(timestamp / 1000, 'unixepoch', 'localtime') as period,
+          COUNT(*) as request_count,
+          SUM(input_tokens) as total_input_tokens,
+          SUM(output_tokens) as total_output_tokens,
+          AVG(duration_ms) as average_latency,
+          SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as error_count,
+          SUM(cost_usd) as total_cost
+        FROM requests
+        WHERE 1=1
+      `;
 
-    const params: any[] = [];
+      const params: any[] = [];
 
-    if (query.startTime) {
-      sql += ' AND timestamp >= ?';
-      params.push(query.startTime);
+      if (query.startTime) {
+        sql += ' AND timestamp >= ?';
+        params.push(query.startTime);
+      }
+
+      if (query.endTime) {
+        sql += ' AND timestamp <= ?';
+        params.push(query.endTime);
+      }
+
+      if (query.provider) {
+        sql += ' AND provider = ?';
+        params.push(query.provider);
+      }
+
+      if (query.model) {
+        sql += ' AND model = ?';
+        params.push(query.model);
+      }
+
+      sql += ' GROUP BY period ORDER BY period DESC';
+
+      if (query.limit) {
+        sql += ' LIMIT ?';
+        params.push(query.limit);
+      }
+
+      const stmt = this.db.prepare(sql);
+      const result = stmt.all(...params) as any[];
+
+      return result.map(row => ({
+        period: row.period,
+        requestCount: row.request_count || 0,
+        totalInputTokens: row.total_input_tokens || 0,
+        totalOutputTokens: row.total_output_tokens || 0,
+        averageLatency: Math.round(row.average_latency || 0),
+        errorCount: row.error_count || 0,
+        totalCost: row.total_cost || 0
+      }));
+    } catch (error) {
+      console.error('[METRICS-DB] Error querying historical metrics:', error);
+      return [];
     }
-
-    if (query.endTime) {
-      sql += ' AND timestamp <= ?';
-      params.push(query.endTime);
-    }
-
-    if (query.provider) {
-      sql += ' AND provider = ?';
-      params.push(query.provider);
-    }
-
-    if (query.model) {
-      sql += ' AND model = ?';
-      params.push(query.model);
-    }
-
-    sql += ' GROUP BY period ORDER BY period DESC';
-
-    if (query.limit) {
-      sql += ' LIMIT ?';
-      params.push(query.limit);
-    }
-
-    const stmt = this.db.prepare(sql);
-    const result = stmt.all(...params);
-
-    return result.map(row => ({
-      period: row.period,
-      requestCount: row.request_count || 0,
-      totalInputTokens: row.total_input_tokens || 0,
-      totalOutputTokens: row.total_output_tokens || 0,
-      averageLatency: Math.round(row.average_latency || 0),
-      errorCount: row.error_count || 0,
-      totalCost: row.total_cost || 0
-    }));
   }
 
   /**
@@ -369,29 +395,39 @@ export class MetricsDatabase {
     dateRange: { earliest: string; latest: string };
     providers: string[];
   } {
-    const totalRequests = this.db.prepare('SELECT COUNT(*) as count FROM requests').get() as any;
-    const dbStats = this.db.prepare('PRAGMA page_count').get() as any;
-    const pageSize = this.db.prepare('PRAGMA page_size').get() as any;
-    const databaseSize = dbStats.page_count * pageSize.page_size;
+    try {
+      const totalRequests = this.db.prepare('SELECT COUNT(*) as count FROM requests').get() as any;
+      const dbStats = this.db.prepare('PRAGMA page_count').get() as any;
+      const pageSize = this.db.prepare('PRAGMA page_size').get() as any;
+      const databaseSize = dbStats.page_count * pageSize.page_size;
 
-    const dateRange = this.db.prepare(`
-      SELECT
-        MIN(datetime(timestamp / 1000, 'unixepoch', 'localtime')) as earliest,
-        MAX(datetime(timestamp / 1000, 'unixepoch', 'localtime')) as latest
-      FROM requests
-    `).get() as any;
+      const dateRange = this.db.prepare(`
+        SELECT
+          MIN(datetime(timestamp / 1000, 'unixepoch', 'localtime')) as earliest,
+          MAX(datetime(timestamp / 1000, 'unixepoch', 'localtime')) as latest
+        FROM requests
+      `).get() as any;
 
-    const providers = this.db.prepare('SELECT DISTINCT provider FROM requests').all() as any[];
+      const providers = this.db.prepare('SELECT DISTINCT provider FROM requests').all() as any[];
 
-    return {
-      totalRequests: totalRequests.count,
-      databaseSize,
-      dateRange: {
-        earliest: dateRange.earliest || 'N/A',
-        latest: dateRange.latest || 'N/A'
-      },
-      providers: providers.map(p => p.provider)
-    };
+      return {
+        totalRequests: totalRequests?.count || 0,
+        databaseSize: databaseSize || 0,
+        dateRange: {
+          earliest: dateRange?.earliest || 'N/A',
+          latest: dateRange?.latest || 'N/A'
+        },
+        providers: providers.map(p => p.provider)
+      };
+    } catch (error) {
+      console.error('[METRICS-DB] Error getting database stats:', error);
+      return {
+        totalRequests: 0,
+        databaseSize: 0,
+        dateRange: { earliest: 'N/A', latest: 'N/A' },
+        providers: []
+      };
+    }
   }
 
   /**

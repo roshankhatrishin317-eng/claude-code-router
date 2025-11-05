@@ -24,6 +24,7 @@ import agentsManager from "./agents";
 import { EventEmitter } from "node:events";
 import { metricsCollector, RequestMetrics } from "./utils/metrics";
 import { systemHealthMonitor } from "./utils/systemHealth";
+import { smartRetry } from "./utils/smartRetry";
 
 const event = new EventEmitter()
 

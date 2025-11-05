@@ -67,6 +67,7 @@ export class AlertingManager extends EventEmitter {
     conditionMet: boolean;
     consecutiveBreaches: number;
   }> = new Map();
+  private evaluationInterval?: NodeJS.Timeout;
 
   constructor() {
     super();
@@ -173,7 +174,7 @@ export class AlertingManager extends EventEmitter {
    * Start alert evaluation loop
    */
   private startEvaluation(): void {
-    setInterval(() => {
+    this.evaluationInterval = setInterval(() => {
       this.evaluateRules();
     }, 30000); // Every 30 seconds
   }
@@ -268,18 +269,19 @@ export class AlertingManager extends EventEmitter {
    */
   private getHealthValue(metric: AlertMetric): number {
     const healthStatus = systemHealthMonitor.getHealthStatus();
+    const systemHealth = systemHealthMonitor.getSystemHealth();
 
     switch (metric.name) {
       case 'health_score':
         return healthStatus.score;
       case 'cpu_usage':
-        return healthStatus.cpuUsage;
+        return systemHealth.cpu.usage;
       case 'memory_usage':
-        return healthStatus.memoryUsage;
+        return systemHealth.memory.usagePercent;
       case 'heap_usage':
-        return healthStatus.heapUsage;
+        return systemHealth.heap.usagePercent;
       case 'event_loop_delay':
-        return healthStatus.eventLoopDelay;
+        return systemHealth.eventLoop.delay;
       default:
         return 0;
     }
@@ -540,6 +542,16 @@ export class AlertingManager extends EventEmitter {
       recentAlerts,
       rulesBySeverity
     };
+  }
+
+  /**
+   * Cleanup method to clear intervals and prevent memory leaks
+   */
+  cleanup(): void {
+    if (this.evaluationInterval) {
+      clearInterval(this.evaluationInterval);
+      this.evaluationInterval = undefined;
+    }
   }
 }
 

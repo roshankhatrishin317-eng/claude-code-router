@@ -15,8 +15,85 @@ import { prometheusExporter } from "./utils/prometheus";
 import { alertingManager } from "./utils/alerting";
 import { realTimeTokenTracker } from "./utils/realTimeTokenTracker";
 import { extractTokensFromResponse, extractTokensFromStreaming } from "./middleware/metrics";
+import { initializeCache, getCache } from "./utils/requestCache";
+import { getCacheConfig } from "./config/cache.config";
+import { cacheMiddleware, cacheResponseMiddleware, interceptResponse } from "./middleware/cache";
+import { getApiKeyPoolConfig } from "./config/apiKeyPool.config";
+import { apiKeyPool } from "./utils/apiKeyPool";
+import { apiKeyPoolMiddleware, apiKeyPoolResponseMiddleware, getSelectedApiKey } from "./middleware/apiKeyPool";
+import { registerApiKeyPoolEndpoints } from "./server.apiKeyPool.endpoints";
+import { getShinModeConfig } from "./config/shinMode.config";
+import { shinModeManager } from "./utils/shinMode";
+import { shinModeMiddleware, shinModeResponseMiddleware } from "./middleware/shinMode";
+import { registerShinModeEndpoints } from "./server.shinMode.endpoints";
+import { getHttpPoolConfig } from "./config/httpConnectionPool.config";
+import { httpConnectionPool } from "./utils/httpConnectionPool";
+import { registerHttpConnectionPoolEndpoints } from "./server.httpConnectionPool.endpoints";
 
 export const createServer = (config: any): Server => {
+  // Initialize cache system
+  const cacheConfig = getCacheConfig(config);
+  if (cacheConfig.enabled) {
+    initializeCache(cacheConfig);
+    console.log('[CACHE] Cache system initialized');
+  }
+
+  // Initialize API Key Pool
+  const apiKeyPoolConfig = getApiKeyPoolConfig(config);
+  if (apiKeyPoolConfig.enabled) {
+    console.log('[API-KEY-POOL] Initializing API key pool...');
+    apiKeyPool.setStrategy(apiKeyPoolConfig.strategy);
+    
+    // Load keys from configuration
+    for (const [provider, providerConfig] of Object.entries(apiKeyPoolConfig.providers)) {
+      if (providerConfig.keys && Array.isArray(providerConfig.keys)) {
+        for (const keyConfig of providerConfig.keys) {
+          apiKeyPool.addKey({
+            key: keyConfig.key,
+            provider,
+            rateLimit: keyConfig.rateLimit,
+            priority: keyConfig.priority || 10,
+            enabled: keyConfig.enabled ?? true,
+            tags: keyConfig.tags,
+          });
+        }
+        console.log(`[API-KEY-POOL] Loaded ${providerConfig.keys.length} keys for provider ${provider}`);
+      }
+    }
+    
+    const stats = apiKeyPool.getStats();
+    console.log(`[API-KEY-POOL] Pool initialized with ${stats.totalKeys} keys, strategy: ${apiKeyPoolConfig.strategy}`);
+  }
+
+  // Initialize Shin Mode
+  const shinModeConfig = getShinModeConfig(config);
+  if (shinModeConfig.enabled) {
+    console.log('[SHIN-MODE] Initializing Shin Mode...');
+    shinModeManager.initialize(shinModeConfig);
+    
+    const stats = shinModeManager.getStats();
+    console.log(`[SHIN-MODE] Initialized in ${stats.mode} mode, providers: ${Object.keys(shinModeConfig.providers).join(', ')}`);
+  }
+
+  // Initialize HTTP Connection Pool
+  const httpPoolConfig = getHttpPoolConfig(config);
+  if (httpPoolConfig.enabled) {
+    console.log('[HTTP-POOL] Initializing HTTP connection keep-alive pool...');
+    
+    // Configure provider-specific settings if provided
+    if (httpPoolConfig.providers) {
+      for (const [provider, providerConfig] of Object.entries(httpPoolConfig.providers)) {
+        httpConnectionPool.configureProvider({
+          provider,
+          ...providerConfig
+        });
+        console.log(`[HTTP-POOL] Configured connection pool for ${provider}`);
+      }
+    }
+    
+    console.log('[HTTP-POOL] Connection pool initialized with keep-alive enabled');
+  }
+
   const server = new Server(config);
 
   // Initialize connection manager with provider configurations
@@ -24,73 +101,95 @@ export const createServer = (config: any): Server => {
     connectionManager.initialize(config.Providers);
   }
 
+  // Register Shin Mode middleware (first - for request queueing)
+  if (shinModeConfig.enabled) {
+    server.app.addHook('preHandler', shinModeMiddleware);
+    server.app.addHook('onResponse', shinModeResponseMiddleware);
+  }
+
+  // Register API key pool middleware (before other middleware for key selection)
+  if (apiKeyPoolConfig.enabled) {
+    server.app.addHook('preHandler', apiKeyPoolMiddleware);
+    server.app.addHook('onResponse', apiKeyPoolResponseMiddleware);
+  }
+
+  // Register cache middleware before metrics (priority order)
+  server.app.addHook('preHandler', cacheMiddleware);
+
   // Register metrics middleware for all API endpoints
   server.app.addHook('preHandler', metricsMiddleware);
 
   // Register response metrics collector
   server.app.addHook('onResponse', collectResponseMetrics);
+  
+  // Register cache response middleware
+  server.app.addHook('onResponse', cacheResponseMiddleware);
 
   // Monkey-patch the response send method to capture tokens
   // This is necessary because @musistudio/llms intercepts responses internally
-  const originalSend = server.app.raw.send;
-  server.app.raw.send = function(data: any) {
-    try {
-      console.log(`[RAW-SEND] Intercepting response`);
+  if (server.app.raw && server.app.raw.send) {
+    const originalSend = server.app.raw.send;
+    server.app.raw.send = function(data: any) {
+      try {
+        console.log(`[RAW-SEND] Intercepting response`);
 
-      // Parse response data
-      let responseData = data;
-      if (typeof data === 'string') {
-        try {
-          responseData = JSON.parse(data);
-        } catch (e) {
-          // Not JSON
+        // Parse response data
+        let responseData = data;
+        if (typeof data === 'string') {
+          try {
+            responseData = JSON.parse(data);
+          } catch (e) {
+            // Not JSON
+          }
         }
-      }
 
-      // Extract session ID from current request context
-      const request = (this as any).request;
-      if (request && request.url && request.url.startsWith('/v1/') && request.method === 'POST') {
-        const metricsContext = (request as any).__metricsContext;
-        if (metricsContext?.sessionId) {
-          const { sessionId } = metricsContext;
+        // Extract session ID from current request context
+        const request = (this as any).request;
+        if (request && request.url && request.url.startsWith('/v1/') && request.method === 'POST') {
+          const metricsContext = (request as any).__metricsContext;
+          if (metricsContext?.sessionId) {
+            const { sessionId } = metricsContext;
 
-          // Extract tokens
-          let inputTokens = 0;
-          let outputTokens = 0;
-          let tokensFound = false;
+            // Extract tokens
+            let inputTokens = 0;
+            let outputTokens = 0;
+            let tokensFound = false;
 
-          if (responseData) {
-            const extractedTokens = extractTokensFromResponse(responseData);
-            if (extractedTokens) {
-              inputTokens = extractedTokens.inputTokens;
-              outputTokens = extractedTokens.outputTokens;
-              tokensFound = extractedTokens.inputTokens > 0 || extractedTokens.outputTokens > 0;
-            }
+            if (responseData) {
+              const extractedTokens = extractTokensFromResponse(responseData);
+              if (extractedTokens) {
+                inputTokens = extractedTokens.inputTokens;
+                outputTokens = extractedTokens.outputTokens;
+                tokensFound = extractedTokens.inputTokens > 0 || extractedTokens.outputTokens > 0;
+              }
 
-            // Try streaming extraction if no tokens found
-            if (!tokensFound) {
-              const streamingTokens = extractTokensFromStreaming(responseData);
-              if (streamingTokens) {
-                inputTokens = streamingTokens.inputTokens;
-                outputTokens = streamingTokens.outputTokens;
-                tokensFound = true;
+              // Try streaming extraction if no tokens found
+              if (!tokensFound) {
+                const streamingTokens = extractTokensFromStreaming(responseData);
+                if (streamingTokens) {
+                  inputTokens = streamingTokens.inputTokens;
+                  outputTokens = streamingTokens.outputTokens;
+                  tokensFound = true;
+                }
               }
             }
-          }
 
-          // Log and update tracker
-          if (tokensFound) {
-            console.log(`[TOKEN-TRACKING] Session ${sessionId}: ${inputTokens} input, ${outputTokens} output tokens`);
-            realTimeTokenTracker.addTokenData(sessionId, inputTokens, outputTokens);
+            // Log and update tracker
+            if (tokensFound) {
+              console.log(`[TOKEN-TRACKING] Session ${sessionId}: ${inputTokens} input, ${outputTokens} output tokens`);
+              realTimeTokenTracker.addTokenData(sessionId, inputTokens, outputTokens);
+            }
           }
         }
+      } catch (error) {
+        console.error('Error in response interceptor:', error);
       }
-    } catch (error) {
-      console.error('Error in response interceptor:', error);
-    }
 
-    return originalSend.call(this, data);
-  };
+      return originalSend.call(this, data);
+    };
+  } else {
+    console.log(`[TOKEN-TRACKING] Warning: server.app.raw is not available, token tracking will be limited`);
+  }
 
   // Add onRequest hook to set up connection pooling and circuit breaker for /v1/messages
   server.app.addHook('onRequest', async (request, reply) => {
@@ -169,13 +268,17 @@ export const createServer = (config: any): Server => {
   });
 
   // Add onResponse hook to release connection
+  // Connection pool cleanup hook (runs after metrics collection)
   server.app.addHook('onResponse', async (request, reply) => {
     if ((request as any).__connectionInfo) {
       try {
         const connection = (request as any).__connectionInfo;
         const context = (request as any).__connectionPoolContext;
 
-        // Record metrics
+        // Note: Metrics are already recorded by collectResponseMetrics middleware
+        // Here we only handle connection cleanup
+        
+        // Record connection-specific metrics to connection manager
         connectionManager.recordRequestMetrics({
           provider: context.provider,
           model: (request.body as any)?.model || 'unknown',
@@ -201,6 +304,75 @@ export const createServer = (config: any): Server => {
     const {messages, tools, system} = req.body;
     const tokenCount = calculateTokenCount(messages, system, tools);
     return { "input_tokens": tokenCount }
+  });
+
+  // Cache management endpoints
+  server.app.get("/api/cache/stats", async (req, reply) => {
+    try {
+      const cache = getCache();
+      if (!cache) {
+        return { enabled: false };
+      }
+      
+      const stats = cache.getStats();
+      return {
+        enabled: true,
+        ...stats
+      };
+    } catch (error) {
+      console.error("Failed to get cache stats:", error);
+      reply.status(500).send({ error: "Failed to get cache stats" });
+    }
+  });
+
+  server.app.post("/api/cache/invalidate", async (req, reply) => {
+    try {
+      const cache = getCache();
+      if (!cache) {
+        reply.status(400).send({ error: "Cache not enabled" });
+        return;
+      }
+
+      const { pattern } = req.body as any;
+      const count = await cache.invalidate(pattern);
+      
+      return {
+        success: true,
+        message: pattern 
+          ? `Invalidated ${count} cache entries matching pattern`
+          : "All cache entries cleared",
+        count
+      };
+    } catch (error) {
+      console.error("Failed to invalidate cache:", error);
+      reply.status(500).send({ error: "Failed to invalidate cache" });
+    }
+  });
+
+  server.app.post("/api/cache/warm", async (req, reply) => {
+    try {
+      const cache = getCache();
+      if (!cache) {
+        reply.status(400).send({ error: "Cache not enabled" });
+        return;
+      }
+
+      const { requests } = req.body as any;
+      if (!Array.isArray(requests)) {
+        reply.status(400).send({ error: "Invalid request format" });
+        return;
+      }
+
+      await cache.warmCache(requests);
+      
+      return {
+        success: true,
+        message: `Cache warmed with ${requests.length} entries`
+      };
+    } catch (error) {
+      console.error("Failed to warm cache:", error);
+      reply.status(500).send({ error: "Failed to warm cache" });
+    }
   });
 
   // Add endpoint to read config.json with access control
@@ -845,6 +1017,21 @@ export const createServer = (config: any): Server => {
       reply.status(500).send({ error: "Failed to get alerting statistics" });
     }
   });
+
+  // Register API Key Pool management endpoints
+  if (apiKeyPoolConfig.enabled) {
+    registerApiKeyPoolEndpoints(server.app);
+  }
+
+  // Register Shin Mode management endpoints
+  if (shinModeConfig.enabled) {
+    registerShinModeEndpoints(server.app);
+  }
+
+  // Register HTTP Connection Pool management endpoints
+  if (httpPoolConfig.enabled) {
+    registerHttpConnectionPoolEndpoints(server.app);
+  }
 
   // Circuit Breaker Management Endpoints
   server.app.get("/api/circuit-breaker/status", async (req, reply) => {

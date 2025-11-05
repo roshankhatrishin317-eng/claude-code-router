@@ -424,9 +424,17 @@ export const circuitBreakerManager = new CircuitBreakerManager();
 circuitBreakerManager['breakers']; // Access private property for type
 
 // Periodic health check and cleanup
-setInterval(() => {
+let circuitBreakerHealthCheckInterval: NodeJS.Timeout | undefined = setInterval(() => {
   const summary = circuitBreakerManager.getHealthSummary();
   if (summary.unhealthy > 0) {
     console.log(`Circuit Breaker Health Check: ${summary.healthy}/${summary.total} providers healthy`);
   }
 }, 60000); // Every minute
+
+// Cleanup function for circuit breaker health check
+export function cleanupCircuitBreakerHealthCheck(): void {
+  if (circuitBreakerHealthCheckInterval) {
+    clearInterval(circuitBreakerHealthCheckInterval);
+    circuitBreakerHealthCheckInterval = undefined;
+  }
+}

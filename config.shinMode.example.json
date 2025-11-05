@@ -1,0 +1,25 @@
+{
+  "ShinMode": {
+    "enabled": true,
+    "mode": "shin",
+    "maxQueueSize": 100,
+    "queueTimeout": 60000,
+    "keepAliveConnections": true,
+    "connectionReuseTime": 5000,
+    "providers": {
+      "anthropic": {
+        "maxConcurrency": 1,
+        "enabled": true
+      },
+      "openai": {
+        "maxConcurrency": 1,
+        "enabled": true
+      },
+      "google": {
+        "maxConcurrency": 1,
+        "enabled": false
+      }
+    }
+  },
+  "Comment": "Shin Mode processes requests sequentially (one at a time per provider) to bypass rate limits and reduce costs through connection reuse"
+}
