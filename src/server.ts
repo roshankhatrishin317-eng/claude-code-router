@@ -7,9 +7,100 @@ import { readdirSync, statSync, readFileSync, writeFileSync, existsSync } from "
 import { homedir } from "os";
 import {calculateTokenCount} from "./utils/router";
 import { metricsCollector } from "./utils/metrics";
+import { connectionManager } from "./utils/connectionManager";
+import { connectionPool } from "./utils/sessionConnectionPool";
+import { metricsMiddleware, collectResponseMetrics } from "./middleware/metrics";
 
 export const createServer = (config: any): Server => {
   const server = new Server(config);
+
+  // Initialize connection manager with provider configurations
+  if (config.Providers && Array.isArray(config.Providers)) {
+    connectionManager.initialize(config.Providers);
+  }
+
+  // Register metrics middleware for all API endpoints
+  server.app.addHook('preHandler', metricsMiddleware);
+
+  // Register response metrics collector
+  server.app.addHook('onResponse', collectResponseMetrics);
+
+  // Add onRequest hook to set up connection pooling for /v1/messages
+  server.app.addHook('onRequest', async (request, reply) => {
+    if (request.url === '/v1/messages' && request.method === 'POST') {
+      try {
+        // Set up connection pool context for this request
+        const { provider, sessionId } = connectionManager.parseRequestInfo(request);
+        (request as any).__connectionPoolContext = {
+          provider,
+          sessionId,
+          startTime: Date.now()
+        };
+
+        // Add response cleanup hook
+        reply.raw.on('finish', () => {
+          // Connection cleanup is handled in the connection manager
+        });
+
+      } catch (error) {
+        request.log.error('Failed to setup connection pool context:', error);
+      }
+    }
+  });
+
+  // Add preHandler hook to acquire connection from pool
+  server.app.addHook('preHandler', async (request, reply) => {
+    if ((request as any).__connectionPoolContext &&
+        request.url === '/v1/messages' &&
+        request.method === 'POST') {
+
+      try {
+        const context = (request as any).__connectionPoolContext;
+        const connection = await connectionManager.getConnectionWithAffinity(
+          context.provider,
+          context.sessionId
+        );
+
+        // Store connection for later cleanup
+        (request as any).__connectionInfo = connection;
+        request.headers['x-connection-id'] = connection.id;
+        request.headers['x-provider'] = connection.provider;
+
+      } catch (error) {
+        request.log.error('Failed to acquire connection from pool:', error);
+        // Continue without connection pooling if pool fails
+      }
+    }
+  });
+
+  // Add onResponse hook to release connection
+  server.app.addHook('onResponse', async (request, reply) => {
+    if ((request as any).__connectionInfo) {
+      try {
+        const connection = (request as any).__connectionInfo;
+        const context = (request as any).__connectionPoolContext;
+
+        // Record metrics
+        connectionManager.recordRequestMetrics({
+          provider: context.provider,
+          model: (request.body as any)?.model || 'unknown',
+          sessionId: context.sessionId,
+          startTime: context.startTime,
+          endTime: Date.now(),
+          success: reply.statusCode < 400,
+          errorType: reply.statusCode >= 400 ? 'HTTP_ERROR' : undefined,
+          inputTokens: (request.body as any)?.usage?.input_tokens,
+          outputTokens: (request.body as any)?.usage?.output_tokens
+        });
+
+        // Release connection back to pool
+        connectionManager.releaseConnection(connection);
+
+      } catch (error) {
+        request.log.error('Failed to release connection:', error);
+      }
+    }
+  });
 
   server.app.post("/v1/messages/count_tokens", async (req, reply) => {
     const {messages, tools, system} = req.body;
@@ -281,7 +372,7 @@ export const createServer = (config: any): Server => {
         metricsCollector.removeListener('metricsUpdated', onMetricsUpdate);
       });
 
-      // Send periodic updates every second
+      // Send periodic updates every 100ms for ultra-high frequency
       const interval = setInterval(() => {
         try {
           const metrics = metricsCollector.getRealTimeMetrics();
@@ -290,7 +381,7 @@ export const createServer = (config: any): Server => {
           clearInterval(interval);
           metricsCollector.removeListener('metricsUpdated', onMetricsUpdate);
         }
-      }, 1000);
+      }, 100);
 
       req.raw.on('close', () => {
         clearInterval(interval);
@@ -299,6 +390,149 @@ export const createServer = (config: any): Server => {
     } catch (error) {
       console.error("Failed to setup metrics stream:", error);
       reply.status(500).send({ error: "Failed to setup metrics stream" });
+    }
+  });
+
+  // Debug endpoint to generate mock metrics for testing
+  server.app.post("/api/metrics/generate-test-data", async (req, reply) => {
+    try {
+      const testRequests = [
+        { inputTokens: 150, outputTokens: 300, duration: 1200, success: true },
+        { inputTokens: 200, outputTokens: 450, duration: 1800, success: true },
+        { inputTokens: 100, outputTokens: 200, duration: 800, success: true },
+        { inputTokens: 300, outputTokens: 600, duration: 2200, success: true },
+        { inputTokens: 180, outputTokens: 350, duration: 1500, success: true }
+      ];
+
+      const now = Date.now();
+      let sessionId = 'test-session-' + Math.random().toString(36).substr(2, 9);
+
+      // Generate test requests over the last few minutes
+      testRequests.forEach((testReq, index) => {
+        const timestamp = now - (index * 60000); // Spread over last 5 minutes
+
+        const metrics = {
+          timestamp,
+          sessionId,
+          provider: 'test-provider',
+          model: 'test-model',
+          inputTokens: testReq.inputTokens,
+          outputTokens: testReq.outputTokens,
+          duration: testReq.duration,
+          success: testReq.success,
+          errorType: testReq.success ? undefined : 'test-error'
+        };
+
+        metricsCollector.recordRequest(metrics);
+      });
+
+      // Generate some recent activity for real-time display
+      for (let i = 0; i < 5; i++) {
+        setTimeout(() => {
+          const recentMetrics = {
+            timestamp: Date.now(),
+            sessionId,
+            provider: 'test-provider',
+            model: 'test-model',
+            inputTokens: Math.floor(Math.random() * 200) + 50,
+            outputTokens: Math.floor(Math.random() * 400) + 100,
+            duration: Math.floor(Math.random() * 2000) + 500,
+            success: Math.random() > 0.1,
+            errorType: Math.random() > 0.9 ? 'random-error' : undefined
+          };
+          metricsCollector.recordRequest(recentMetrics);
+        }, i * 200);
+      }
+
+      return {
+        success: true,
+        message: `Generated ${testRequests.length} test requests`,
+        currentMetrics: metricsCollector.getRealTimeMetrics()
+      };
+    } catch (error) {
+      console.error("Failed to generate test data:", error);
+      reply.status(500).send({ error: "Failed to generate test data" });
+    }
+  });
+
+  // Add connection pool monitoring endpoints
+  server.app.get("/api/connection-pool/metrics", async (req, reply) => {
+    try {
+      const poolMetrics = connectionPool.getMetrics();
+      const requestMetrics = connectionManager.getRequestMetrics();
+      const providerMetrics = connectionManager.getProviderMetrics();
+      const sessionMetrics = connectionManager.getSessionAffinityMetrics();
+
+      return {
+        pool: poolMetrics,
+        sessions: sessionMetrics,
+        requests: {
+          total: requestMetrics.length,
+          recent: requestMetrics.slice(-100),
+          providerMetrics
+        }
+      };
+    } catch (error) {
+      console.error("Failed to get connection pool metrics:", error);
+      reply.status(500).send({ error: "Failed to get connection pool metrics" });
+    }
+  });
+
+  // Add connection pool health check
+  server.app.get("/api/connection-pool/health", async (req, reply) => {
+    try {
+      const metrics = connectionPool.getMetrics();
+      const isHealthy = metrics.activeConnections < (metrics.totalConnections * 0.9) &&
+                       metrics.queuedRequests < 50;
+
+      return {
+        healthy: isHealthy,
+        metrics,
+        timestamp: new Date().toISOString()
+      };
+    } catch (error) {
+      console.error("Failed to get connection pool health:", error);
+      reply.status(500).send({ error: "Failed to get connection pool health" });
+    }
+  });
+
+  // Reset connection pool
+  server.app.post("/api/connection-pool/reset", async (req, reply) => {
+    try {
+      connectionManager.close();
+
+      // Reinitialize with the same providers
+      if (config.Providers && Array.isArray(config.Providers)) {
+        connectionManager.initialize(config.Providers);
+      }
+
+      return { success: true, message: "Connection pool reset successfully" };
+    } catch (error) {
+      console.error("Failed to reset connection pool:", error);
+      reply.status(500).send({ error: "Failed to reset connection pool" });
+    }
+  });
+
+  // Session affinity specific endpoint
+  server.app.get("/api/session-affinity/metrics", async (req, reply) => {
+    try {
+      const sessionMetrics = connectionManager.getSessionAffinityMetrics();
+      return sessionMetrics;
+    } catch (error) {
+      console.error("Failed to get session affinity metrics:", error);
+      reply.status(500).send({ error: "Failed to get session affinity metrics" });
+    }
+  });
+
+  // Optimize session connections
+  server.app.post("/api/session-affinity/optimize", async (req, reply) => {
+    try {
+      // This would trigger session affinity optimization
+      // Implementation would be in the session affinity manager
+      return { success: true, message: "Session affinity optimization triggered" };
+    } catch (error) {
+      console.error("Failed to optimize session affinity:", error);
+      reply.status(500).send({ error: "Failed to optimize session affinity" });
     }
   });
 

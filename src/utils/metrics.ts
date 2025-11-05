@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { realTimeTokenTracker } from './realTimeTokenTracker';
 
 export interface RequestMetrics {
   timestamp: number;
@@ -15,6 +16,8 @@ export interface RequestMetrics {
 export interface RealTimeMetrics {
   requestsPerMinute: number;
   tokensPerSecond: number;
+  inputTPS: number;
+  outputTPS: number;
   activeSessions: number;
   totalRequests: number;
   errorRate: number;
@@ -81,7 +84,7 @@ export class MetricsCollector extends EventEmitter {
   private activeSessions: Map<string, SessionMetrics> = new Map();
   private providerMetrics: Map<string, ProviderMetrics> = new Map();
   private lastMinuteRequests: RequestMetrics[] = [];
-  private lastSecondTokens: { tokens: number; timestamp: number }[] = [];
+  private lastSecondTokens: { tokens: number; inputTokens: number; outputTokens: number; timestamp: number }[] = [];
 
   private readonly MAX_HISTORY_SIZE = 10000;
   private readonly ONE_MINUTE = 60 * 1000;
@@ -92,9 +95,20 @@ export class MetricsCollector extends EventEmitter {
     ['anthropic:claude-3-opus', { inputCostPer1K: 0.015, outputCostPer1K: 0.075 }],
     ['anthropic:claude-3-sonnet', { inputCostPer1K: 0.003, outputCostPer1K: 0.015 }],
     ['anthropic:claude-3-haiku', { inputCostPer1K: 0.00025, outputCostPer1K: 0.00125 }],
+    ['anthropic:claude-3-5-sonnet', { inputCostPer1K: 0.003, outputCostPer1K: 0.015 }],
     ['openai:gpt-4', { inputCostPer1K: 0.03, outputCostPer1K: 0.06 }],
     ['openai:gpt-4-turbo', { inputCostPer1K: 0.01, outputCostPer1K: 0.03 }],
+    ['openai:gpt-4o', { inputCostPer1K: 0.005, outputCostPer1K: 0.015 }],
+    ['openai:gpt-4o-mini', { inputCostPer1K: 0.00015, outputCostPer1K: 0.0006 }],
     ['openai:gpt-3.5-turbo', { inputCostPer1K: 0.001, outputCostPer1K: 0.002 }],
+    ['google:gemini-1.5-pro', { inputCostPer1K: 0.0035, outputCostPer1K: 0.0105 }],
+    ['google:gemini-1.5-flash', { inputCostPer1K: 0.00015, outputCostPer1K: 0.0006 }],
+    ['deepseek:deepseek-chat', { inputCostPer1K: 0.00014, outputCostPer1K: 0.00028 }],
+    ['deepseek:deepseek-coder', { inputCostPer1K: 0.00014, outputCostPer1K: 0.00028 }],
+    ['groq:llama-3.1-405b', { inputCostPer1K: 0.00089, outputCostPer1K: 0.00089 }],
+    ['groq:llama-3.1-70b', { inputCostPer1K: 0.00059, outputCostPer1K: 0.00079 }],
+    ['openrouter:openai/gpt-4o', { inputCostPer1K: 0.005, outputCostPer1K: 0.015 }],
+    ['openrouter:anthropic/claude-3.5-sonnet', { inputCostPer1K: 0.003, outputCostPer1K: 0.015 }],
   ]);
 
   constructor() {
@@ -143,6 +157,8 @@ export class MetricsCollector extends EventEmitter {
     const totalTokens = metrics.inputTokens + metrics.outputTokens;
     this.lastSecondTokens.push({
       tokens: totalTokens,
+      inputTokens: metrics.inputTokens,
+      outputTokens: metrics.outputTokens,
       timestamp: metrics.timestamp
     });
 
@@ -255,6 +271,11 @@ export class MetricsCollector extends EventEmitter {
     );
     const tps = recentTokens;
 
+    // Advanced real-time TPS calculation with high precision
+    const realTimeTPS = realTimeTokenTracker.getTPS();
+    const inputTokensInLastSecond = realTimeTPS.inputTPS;
+    const outputTokensInLastSecond = realTimeTPS.outputTPS;
+
     // Calculate input/output tokens per minute
     const inputTokensPerMinute = this.lastMinuteRequests.reduce(
       (sum, req) => sum + req.inputTokens, 0
@@ -286,6 +307,8 @@ export class MetricsCollector extends EventEmitter {
     return {
       requestsPerMinute: rpm,
       tokensPerSecond: tps,
+      inputTPS: inputTokensInLastSecond,
+      outputTPS: outputTokensInLastSecond,
       activeSessions: this.activeSessions.size,
       totalRequests: this.requestHistory.length,
       errorRate: Math.round(errorRate * 100) / 100,

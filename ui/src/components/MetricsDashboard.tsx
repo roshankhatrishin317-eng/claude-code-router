@@ -24,6 +24,8 @@ import {
 interface RealTimeMetrics {
   requestsPerMinute: number;
   tokensPerSecond: number;
+  inputTPS: number;
+  outputTPS: number;
   activeSessions: number;
   totalRequests: number;
   errorRate: number;
@@ -153,65 +155,92 @@ export function MetricsDashboard() {
   const [isConnected, setIsConnected] = useState(false);
   const [selectedTab, setSelectedTab] = useState<'overview' | 'tokens' | 'providers' | 'sessions' | 'history'>('overview');
   const [isLoading, setIsLoading] = useState(true);
+  const [lastUpdateTime, setLastUpdateTime] = useState<number>(Date.now());
+  const [refreshTrigger, setRefreshTrigger] = useState(0);
+  const [connectionErrors, setConnectionErrors] = useState(0);
 
-  useEffect(() => {
-    // Fetch initial data
-    fetchAllMetrics();
-
-    // Setup SSE connection for real-time updates
-    const eventSource = new EventSource('http://127.0.0.1:3456/api/metrics/stream');
-
-    eventSource.onopen = () => {
-      setIsConnected(true);
-      setIsLoading(false);
-      console.log('Connected to metrics stream');
-    };
-
-    eventSource.onmessage = (event) => {
-      try {
-        const metrics = JSON.parse(event.data);
-        setRealTimeMetrics(metrics);
-      } catch (error) {
-        console.error('Error parsing metrics data:', error);
+  // Thread-safe state update function with improved race condition prevention
+  const updateRealTimeMetrics = (newMetrics: RealTimeMetrics) => {
+    setRealTimeMetrics(prev => {
+      // Prevent race conditions with timestamp check and data validation
+      if (newMetrics &&
+          newMetrics.totalRequests >= 0 &&
+          newMetrics.requestsPerMinute >= 0 &&
+          (!prev ||
+           newMetrics.totalRequests !== prev.totalRequests ||
+           newMetrics.requestsPerMinute !== prev.requestsPerMinute ||
+           Math.abs(newMetrics.tokensPerSecond - prev.tokensPerSecond) > 0.1)) {
+        setLastUpdateTime(Date.now());
+        return newMetrics;
       }
-    };
+      return prev;
+    });
+  };
 
-    eventSource.onerror = () => {
-      setIsConnected(false);
-      console.log('Metrics stream connection error');
-    };
+  // High-frequency metrics fetcher with improved error handling and debouncing
+  const fetchRealTimeMetrics = async () => {
+    // Debounce to prevent excessive requests
+    const now = Date.now();
+    if (now - lastUpdateTime < 50) { // 50ms minimum interval
+      return;
+    }
 
-    // Refresh other metrics every 2 seconds
-    const interval = setInterval(() => {
-      fetchAllMetrics();
-    }, 2000);
-
-    // Always refresh realtime metrics every second for guaranteed updates
-    const realtimeInterval = setInterval(() => {
-      fetch('http://127.0.0.1:3456/api/metrics/realtime')
-        .then(res => res.json())
-        .then(metrics => {
-          setRealTimeMetrics(metrics);
-          setIsLoading(false);
-        })
-        .catch(error => console.error('Error fetching realtime metrics:', error));
-    }, 1000);
-
-    return () => {
-      eventSource.close();
-      clearInterval(interval);
-      clearInterval(realtimeInterval);
-    };
-  }, []);
-
-  const fetchAllMetrics = async () => {
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 200); // Increased timeout to 200ms
+
+      const response = await fetch('http://127.0.0.1:3456/api/metrics/realtime', {
+        signal: controller.signal,
+        headers: {
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache'
+        }
+      });
+
+      clearTimeout(timeoutId);
+
+      if (response.ok) {
+        const metrics = await response.json();
+
+        // Validate metrics data before updating
+        if (metrics && typeof metrics.totalRequests === 'number') {
+          updateRealTimeMetrics(metrics);
+          setIsConnected(true);
+          setConnectionErrors(0);
+        }
+      } else {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+    } catch (error) {
+      setConnectionErrors(prev => {
+        const newCount = prev + 1;
+        if (newCount > 5) {
+          setIsConnected(false);
+        }
+        return newCount;
+      });
+
+      // Only log errors occasionally to prevent console spam
+      if (connectionErrors % 10 === 0) {
+        console.error('Real-time metrics fetch error:', error);
+      }
+    }
+  };
+
+  // Optimized fetch for other metrics
+  const fetchSecondaryMetrics = async () => {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 500);
+
       const [providersRes, sessionsRes, historyRes, tokensRes] = await Promise.all([
-        fetch('http://127.0.0.1:3456/api/metrics/providers'),
-        fetch('http://127.0.0.1:3456/api/metrics/sessions'),
-        fetch('http://127.0.0.1:3456/api/metrics/history?limit=50'),
-        fetch('http://127.0.0.1:3456/api/metrics/tokens')
+        fetch('http://127.0.0.1:3456/api/metrics/providers', { signal: controller.signal }),
+        fetch('http://127.0.0.1:3456/api/metrics/sessions', { signal: controller.signal }),
+        fetch('http://127.0.0.1:3456/api/metrics/history?limit=50', { signal: controller.signal }),
+        fetch('http://127.0.0.1:3456/api/metrics/tokens', { signal: controller.signal })
       ]);
+
+      clearTimeout(timeoutId);
 
       if (providersRes.ok) {
         const providers = await providersRes.json();
@@ -233,10 +262,82 @@ export function MetricsDashboard() {
         setTokenAnalytics(tokens);
       }
     } catch (error) {
-      console.error('Error fetching metrics:', error);
+      console.error('Secondary metrics fetch error:', error);
     }
   };
 
+  // Manual refresh function
+  const handleManualRefresh = () => {
+    setRefreshTrigger(prev => prev + 1);
+    fetchRealTimeMetrics();
+    fetchSecondaryMetrics();
+  };
+
+  // Generate test data function
+  const handleGenerateTestData = async () => {
+    try {
+      const response = await fetch('http://127.0.0.1:3456/api/metrics/generate-test-data', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+
+      if (response.ok) {
+        const result = await response.json();
+        console.log('Generated test data:', result);
+        // Trigger immediate refresh to show the new data
+        setTimeout(() => {
+          fetchRealTimeMetrics();
+          fetchSecondaryMetrics();
+        }, 500);
+      }
+    } catch (error) {
+      console.error('Failed to generate test data:', error);
+    }
+  };
+
+  useEffect(() => {
+    let rafId: number;
+    let lastFrameTime = 0;
+    const targetFrameTime = 70; // 0.07 seconds = 70ms
+
+    // Fetch initial data
+    const initializeData = async () => {
+      await fetchRealTimeMetrics();
+      await fetchSecondaryMetrics();
+      setIsLoading(false);
+    };
+
+    initializeData();
+
+    // High-frequency update loop using requestAnimationFrame for smooth updates
+    const highFrequencyUpdate = (timestamp: number) => {
+      if (timestamp - lastFrameTime >= targetFrameTime) {
+        fetchRealTimeMetrics();
+        lastFrameTime = timestamp;
+      }
+      rafId = requestAnimationFrame(highFrequencyUpdate);
+    };
+
+    // Start the high-frequency update loop
+    rafId = requestAnimationFrame(highFrequencyUpdate);
+
+    // Update secondary metrics less frequently
+    const secondaryInterval = setInterval(() => {
+      fetchSecondaryMetrics();
+    }, 1000); // Update secondary data every 1 second
+
+    // Cleanup function
+    return () => {
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+      }
+      clearInterval(secondaryInterval);
+    };
+  }, [refreshTrigger, connectionErrors]);
+
+  
   const getStatusColor = (value: number, type: 'latency' | 'errorRate') => {
     if (type === 'latency') {
       if (value < 1000) return 'success';
@@ -264,8 +365,9 @@ export function MetricsDashboard() {
     return (
       <div className="flex items-center justify-center h-64">
         <div className="flex flex-col items-center space-y-4">
-          <Loader2 className="h-8 w-8 animate-spin text-blue-600" />
-          <div className="text-lg text-gray-600">Loading metrics dashboard...</div>
+          <Loader2 className="h-12 w-12 animate-spin text-blue-600" />
+          <div className="text-xl font-semibold text-gray-700">Initializing Metrics Dashboard...</div>
+          <div className="text-sm text-gray-500">Connecting to real-time data stream</div>
         </div>
       </div>
     );
@@ -274,7 +376,24 @@ export function MetricsDashboard() {
   if (!realTimeMetrics) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="text-lg text-gray-600">No metrics data available</div>
+        <div className="flex flex-col items-center space-y-4">
+          <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center">
+            <BarChart3 className="h-8 w-8 text-gray-400" />
+          </div>
+          <div className="text-xl font-semibold text-gray-700">No Metrics Data Available</div>
+          <div className="text-sm text-gray-500 text-center max-w-md">
+            Start by clicking "Generate Test Data" to populate the dashboard with sample metrics,
+            or make actual API requests through the router to see real-time tracking.
+          </div>
+          <Button
+            onClick={handleGenerateTestData}
+            variant="outline"
+            className="mt-4"
+          >
+            <Database className="h-4 w-4 mr-2" />
+            Generate Test Data
+          </Button>
+        </div>
       </div>
     );
   }
@@ -298,15 +417,36 @@ export function MetricsDashboard() {
                 {isConnected ? 'Connected' : 'Disconnected'}
               </span>
             </div>
-            <Button
-              onClick={fetchAllMetrics}
-              variant="outline"
-              size="sm"
-              className="hover:bg-blue-50 hover:border-blue-300 transition-colors"
-            >
-              <Activity className="h-4 w-4 mr-2" />
-              Refresh
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button
+                onClick={handleGenerateTestData}
+                variant="outline"
+                size="sm"
+                className="hover:bg-green-50 hover:border-green-300 hover:text-green-700 transition-all duration-200 transform hover:scale-105"
+                disabled={isLoading}
+              >
+                <Database className="h-4 w-4 mr-2" />
+                Generate Test Data
+              </Button>
+
+              <Button
+                onClick={handleManualRefresh}
+                variant="outline"
+                size="sm"
+                className="hover:bg-blue-50 hover:border-blue-300 transition-all duration-200 transform hover:scale-105"
+                disabled={isLoading}
+              >
+                <Activity className={`h-4 w-4 mr-2 ${isLoading ? 'animate-spin' : ''}`} />
+                Refresh
+              </Button>
+            </div>
+
+            <div className="flex flex-col items-end gap-1">
+              <div className={`w-3 h-3 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'} animate-pulse shadow-lg`} />
+              <div className="text-xs text-gray-600 bg-gray-100 px-2 py-1 rounded font-mono">
+                {lastUpdateTime ? new Date(lastUpdateTime).toLocaleTimeString() : ''}
+              </div>
+            </div>
           </div>
         </div>
 
@@ -377,12 +517,51 @@ export function MetricsDashboard() {
             />
           </div>
 
-          {/* Token Metrics Row */}
+          {/* Real-time Token Metrics Row */}
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+            <MetricCard
+              title="Input TPS"
+              value={formatNumber(realTimeMetrics.inputTPS ?? 0)}
+              subtitle="Input tokens per second"
+              icon={<TrendingUp className="h-5 w-5" />}
+              color="success"
+              loading={isLoading}
+            />
+
+            <MetricCard
+              title="Output TPS"
+              value={formatNumber(realTimeMetrics.outputTPS ?? 0)}
+              subtitle="Output tokens per second"
+              icon={<TrendingUp className="h-5 w-5" />}
+              color="warning"
+              loading={isLoading}
+            />
+
+            <MetricCard
+              title="Total TPS"
+              value={formatNumber(realTimeMetrics.tokensPerSecond ?? 0)}
+              subtitle="Combined tokens per second"
+              icon={<Zap className="h-5 w-5" />}
+              color="info"
+              loading={isLoading}
+            />
+
+            <MetricCard
+              title="TPS Ratio I/O"
+              value={`${((realTimeMetrics.inputTPS ?? 0) / Math.max((realTimeMetrics.outputTPS ?? 0), 1)).toFixed(2)}:1`}
+              subtitle="Input to output TPS ratio"
+              icon={<Cpu className="h-5 w-5" />}
+              color="default"
+              loading={isLoading}
+            />
+          </div>
+
+          {/* Cumulative Token Metrics Row */}
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
             <MetricCard
               title="Input Tokens/Min"
-              value={formatNumber(realTimeMetrics.inputTokensPerMinute || 0)}
-              subtitle="Input token rate"
+              value={formatNumber(realTimeMetrics.inputTokensPerMinute ?? 0)}
+              subtitle="Input token rate per minute"
               icon={<Database className="h-5 w-5" />}
               color="info"
               loading={isLoading}
@@ -390,8 +569,8 @@ export function MetricsDashboard() {
 
             <MetricCard
               title="Output Tokens/Min"
-              value={formatNumber(realTimeMetrics.outputTokensPerMinute || 0)}
-              subtitle="Output token rate"
+              value={formatNumber(realTimeMetrics.outputTokensPerMinute ?? 0)}
+              subtitle="Output token rate per minute"
               icon={<Globe className="h-5 w-5" />}
               color="success"
               loading={isLoading}
@@ -399,19 +578,19 @@ export function MetricsDashboard() {
 
             <MetricCard
               title="Total Input Tokens"
-              value={formatNumber(realTimeMetrics.totalInputTokens || 0)}
+              value={formatNumber(realTimeMetrics.totalInputTokens ?? 0)}
               subtitle="All-time input tokens"
               icon={<Database className="h-5 w-5" />}
-              color="info"
+              color="default"
               loading={isLoading}
             />
 
             <MetricCard
               title="Total Output Tokens"
-              value={formatNumber(realTimeMetrics.totalOutputTokens || 0)}
+              value={formatNumber(realTimeMetrics.totalOutputTokens ?? 0)}
               subtitle="All-time output tokens"
               icon={<Globe className="h-5 w-5" />}
-              color="success"
+              color="default"
               loading={isLoading}
             />
           </div>
