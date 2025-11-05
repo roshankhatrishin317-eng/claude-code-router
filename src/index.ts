@@ -23,8 +23,12 @@ import { IAgent } from "./agents/type";
 import agentsManager from "./agents";
 import { EventEmitter } from "node:events";
 import { metricsCollector, RequestMetrics } from "./utils/metrics";
+import { systemHealthMonitor } from "./utils/systemHealth";
 
 const event = new EventEmitter()
+
+// Start system health monitoring
+systemHealthMonitor.startMonitoring(2000); // Monitor every 2 seconds
 
 async function initializeClaudeConfig() {
   const homeDir = homedir();

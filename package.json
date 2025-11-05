@@ -22,9 +22,12 @@
     "@fastify/static": "^8.2.0",
     "@musistudio/llms": "^1.0.39",
     "@inquirer/prompts": "^5.0.0",
+    "@fastify/jwt": "^9.0.2",
+    "better-sqlite3": "^11.7.0",
     "dotenv": "^16.4.7",
     "find-process": "^2.0.0",
     "json5": "^2.2.3",
+    "jsonwebtoken": "^9.0.2",
     "lru-cache": "^11.2.2",
     "minimist": "^1.2.8",
     "openurl": "^1.1.1",
@@ -34,6 +37,7 @@
     "uuid": "^11.1.0"
   },
   "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.8",
     "@types/node": "^24.0.15",
     "esbuild": "^0.25.1",
     "fastify": "^5.4.0",

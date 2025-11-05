@@ -38,65 +38,37 @@ export const metricsMiddleware = async (req: FastifyRequest, reply: FastifyReply
     }
   }
 
+  // Extract IP address and user agent
+  const ipAddress = req.ip || req.headers['x-forwarded-for'] as string || req.headers['x-real-ip'] as string || 'unknown';
+  const userAgent = req.headers['user-agent'] as string || 'unknown';
+
   // Store enhanced metrics context
   (req as any).__metricsContext = {
     startTime,
     sessionId,
     provider,
-    model
-  };
-
-  // Intercept response to capture token usage in real-time
-  const originalSend = reply.raw.send;
-  reply.raw.send = function(data: any) {
-    try {
-      // Try to extract token usage from response
-      let inputTokens = 0;
-      let outputTokens = 0;
-
-      if (typeof data === 'string') {
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.usage) {
-            inputTokens = parsed.usage.input_tokens || 0;
-            outputTokens = parsed.usage.output_tokens || 0;
-          }
-        } catch (e) {
-          // Not JSON, ignore
-        }
-      } else if (data && typeof data === 'object') {
-        if (data.usage) {
-          inputTokens = data.usage.input_tokens || 0;
-          outputTokens = data.usage.output_tokens || 0;
-        }
-      }
-
-      // Real-time token tracking with advanced tracker
-      if (inputTokens > 0 || outputTokens > 0) {
-        realTimeTokenTracker.addTokenData(sessionId, inputTokens, outputTokens);
-      }
-
-    } catch (error) {
-      console.error('Error in response interceptor:', error);
-    }
-
-    return originalSend.call(this, data);
+    model,
+    ipAddress,
+    userAgent
   };
 };
 
 // Response metrics collector to be used with onResponse hook
 export const collectResponseMetrics = async (req: FastifyRequest, reply: FastifyReply) => {
   try {
+    console.log(`[COLLECT-RESPONSE] onResponse hook called for ${req.url}`);
+
     const metricsContext = (req as any).__metricsContext;
     if (!metricsContext) return;
 
-    const { startTime, sessionId, provider, model } = metricsContext;
+    const { startTime, sessionId, provider, model, ipAddress, userAgent } = metricsContext;
     const duration = Date.now() - startTime;
+    const statusCode = reply.statusCode;
 
-    // Extract token usage from response or session cache
+    // Extract token usage from response or session cache with enhanced logic
     let inputTokens = 0;
     let outputTokens = 0;
-    let success = reply.statusCode < 400;
+    let success = statusCode < 400;
     let errorType = undefined;
 
     // Try to get token usage from session cache first
@@ -113,6 +85,36 @@ export const collectResponseMetrics = async (req: FastifyRequest, reply: Fastify
       }
     }
 
+    // If no tokens from cache, try to extract from response
+    if (inputTokens === 0 && outputTokens === 0) {
+      try {
+        console.log(`[COLLECT-RESPONSE] reply object keys: ${Object.keys(reply).join(', ')}`);
+
+        // Try to get response data from reply body or context
+        let responseData = (reply as any)._responseData;
+        console.log(`[COLLECT-RESPONSE] reply._responseData: ${!!responseData}`);
+
+        // Also try to get from request context (set by response interceptor)
+        if (!responseData && (req as any).__responseData) {
+          responseData = (req as any).__responseData;
+          console.log(`[COLLECT-RESPONSE] req.__responseData found`);
+        } else {
+          console.log(`[COLLECT-RESPONSE] req.__responseData not found`);
+        }
+
+        if (responseData) {
+          console.log(`[COLLECT-RESPONSE] Response data type: ${typeof responseData}, has usage: ${!!(responseData.usage)}`);
+          const extractedTokens = extractTokensWithFallback(responseData);
+          inputTokens = extractedTokens.inputTokens;
+          outputTokens = extractedTokens.outputTokens;
+          console.log(`[COLLECT-RESPONSE] Extracted tokens: input=${inputTokens}, output=${outputTokens}`);
+        }
+      } catch (extractError) {
+        console.error(`[COLLECT-RESPONSE] Extract error:`, extractError);
+        // Ignore extraction errors
+      }
+    }
+
     const metrics: RequestMetrics = {
       timestamp: startTime,
       sessionId,
@@ -122,7 +124,10 @@ export const collectResponseMetrics = async (req: FastifyRequest, reply: Fastify
       outputTokens,
       duration,
       success,
-      errorType
+      errorType,
+      statusCode,
+      ipAddress,
+      userAgent
     };
 
     metricsCollector.recordRequest(metrics);
@@ -164,3 +169,140 @@ export const trackStreamMetrics = (req: FastifyRequest, startTime: number) => {
     }
   };
 };
+
+/**
+ * Enhanced token extraction for all LLM provider formats
+ * Handles OpenAI, Anthropic, DeepSeek, and other providers
+ */
+export function extractTokensFromResponse(response: any): { inputTokens: number; outputTokens: number } | null {
+  if (!response || !response.usage) {
+    return null;
+  }
+
+  const usage = response.usage;
+  let inputTokens = 0;
+  let outputTokens = 0;
+
+  // OpenAI format: prompt_tokens, completion_tokens
+  if (usage.prompt_tokens !== undefined) {
+    inputTokens = usage.prompt_tokens;
+  } else if (usage.input_tokens !== undefined) {
+    inputTokens = usage.input_tokens;
+  } else if (usage.promptTokenCount !== undefined) {
+    inputTokens = usage.promptTokenCount;
+  }
+
+  // Output tokens - multiple possible field names
+  if (usage.completion_tokens !== undefined) {
+    outputTokens = usage.completion_tokens;
+  } else if (usage.output_tokens !== undefined) {
+    outputTokens = usage.output_tokens;
+  } else if (usage.completionTokenCount !== undefined) {
+    outputTokens = usage.completionTokenCount;
+  } else if (usage.max_output_tokens !== undefined) {
+    outputTokens = usage.max_output_tokens;
+  }
+
+  // If we found tokens, return them
+  if (inputTokens > 0 || outputTokens > 0) {
+    return { inputTokens, outputTokens };
+  }
+
+  return null;
+}
+
+/**
+ * Extract tokens from streaming responses
+ * Handles SSE streams and chunked responses
+ */
+export function extractTokensFromStreaming(data: any): { inputTokens: number; outputTokens: number } | null {
+  try {
+    // Handle Server-Sent Events (SSE) format
+    if (typeof data === 'string') {
+      // SSE format: "data: {...}\n\n"
+      if (data.startsWith('data: ')) {
+        const jsonStr = data.replace(/^data: /, '').trim();
+        if (jsonStr === '[DONE]') {
+          return null;
+        }
+
+        try {
+          const parsed = JSON.parse(jsonStr);
+          return extractTokensFromResponse(parsed);
+        } catch (e) {
+          // Invalid JSON in SSE data
+        }
+      }
+    }
+
+    // Handle chunked streaming responses
+    if (data && typeof data === 'object') {
+      // Look for usage in streaming chunks
+      if (data.usage) {
+        return extractTokensFromResponse(data);
+      }
+
+      // Some providers send usage in delta
+      if (data.delta && data.delta.usage) {
+        return extractTokensFromResponse({ usage: data.delta.usage });
+      }
+    }
+
+    return null;
+  } catch (error) {
+    return null;
+  }
+}
+
+/**
+ * Fallback token estimation based on text length
+ * Used when exact token counts are not available
+ */
+function estimateTokensFromText(text: string): number {
+  if (!text) return 0;
+
+  // Rough estimation: ~4 characters per token for English text
+  // This is a fallback when exact token counts aren't available
+  const estimatedTokens = Math.ceil(text.length / 4);
+  return estimatedTokens;
+}
+
+/**
+ * Enhanced token extraction with fallback estimation
+ * Tries multiple strategies to get token counts
+ */
+export function extractTokensWithFallback(response: any): { inputTokens: number; outputTokens: number } {
+  // First try exact extraction
+  let result = extractTokensFromResponse(response);
+  if (result) {
+    return result;
+  }
+
+  // Try streaming extraction
+  result = extractTokensFromStreaming(response);
+  if (result) {
+    return result;
+  }
+
+  // Fallback: estimate from text content
+  let inputText = '';
+  let outputText = '';
+
+  if (response.messages) {
+    // Extract input text from messages
+    for (const msg of response.messages) {
+      if (msg.content) {
+        inputText += typeof msg.content === 'string' ? msg.content : '';
+      }
+    }
+  }
+
+  if (response.choices && response.choices[0] && response.choices[0].message) {
+    outputText = response.choices[0].message.content || '';
+  }
+
+  const inputTokens = estimateTokensFromText(inputText);
+  const outputTokens = estimateTokensFromText(outputText);
+
+  return { inputTokens, outputTokens };
+}

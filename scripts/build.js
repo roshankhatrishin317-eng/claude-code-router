@@ -9,7 +9,23 @@ console.log('Building Claude Code Router...');
 try {
   // Build the main CLI application
   console.log('Building CLI application...');
-  execSync('esbuild src/cli.ts --bundle --platform=node --outfile=dist/cli.js', { stdio: 'inherit' });
+  execSync('esbuild src/cli.ts --bundle --platform=node --outfile=dist/cli.js ' +
+    '--external:better-sqlite3 ' +
+    '--external:jsonwebtoken ' +
+    '--external:@fastify/jwt ' +
+    '--external:@fastify/static ' +
+    '--external:@musistudio/llms ' +
+    '--external:@inquirer/prompts ' +
+    '--external:dotenv ' +
+    '--external:find-process ' +
+    '--external:json5 ' +
+    '--external:lru-cache ' +
+    '--external:minimist ' +
+    '--external:openurl ' +
+    '--external:rotating-file-stream ' +
+    '--external:shell-quote ' +
+    '--external:tiktoken ' +
+    '--external:uuid', { stdio: 'inherit' });
   
   // Copy the tiktoken WASM file
   console.log('Copying tiktoken WASM file...');

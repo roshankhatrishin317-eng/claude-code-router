@@ -10,6 +10,11 @@ import { metricsCollector } from "./utils/metrics";
 import { connectionManager } from "./utils/connectionManager";
 import { connectionPool } from "./utils/sessionConnectionPool";
 import { metricsMiddleware, collectResponseMetrics } from "./middleware/metrics";
+import { circuitBreakerManager } from "./utils/circuitBreaker";
+import { prometheusExporter } from "./utils/prometheus";
+import { alertingManager } from "./utils/alerting";
+import { realTimeTokenTracker } from "./utils/realTimeTokenTracker";
+import { extractTokensFromResponse, extractTokensFromStreaming } from "./middleware/metrics";
 
 export const createServer = (config: any): Server => {
   const server = new Server(config);
@@ -25,12 +30,102 @@ export const createServer = (config: any): Server => {
   // Register response metrics collector
   server.app.addHook('onResponse', collectResponseMetrics);
 
-  // Add onRequest hook to set up connection pooling for /v1/messages
+  // Monkey-patch the response send method to capture tokens
+  // This is necessary because @musistudio/llms intercepts responses internally
+  const originalSend = server.app.raw.send;
+  server.app.raw.send = function(data: any) {
+    try {
+      console.log(`[RAW-SEND] Intercepting response`);
+
+      // Parse response data
+      let responseData = data;
+      if (typeof data === 'string') {
+        try {
+          responseData = JSON.parse(data);
+        } catch (e) {
+          // Not JSON
+        }
+      }
+
+      // Extract session ID from current request context
+      const request = (this as any).request;
+      if (request && request.url && request.url.startsWith('/v1/') && request.method === 'POST') {
+        const metricsContext = (request as any).__metricsContext;
+        if (metricsContext?.sessionId) {
+          const { sessionId } = metricsContext;
+
+          // Extract tokens
+          let inputTokens = 0;
+          let outputTokens = 0;
+          let tokensFound = false;
+
+          if (responseData) {
+            const extractedTokens = extractTokensFromResponse(responseData);
+            if (extractedTokens) {
+              inputTokens = extractedTokens.inputTokens;
+              outputTokens = extractedTokens.outputTokens;
+              tokensFound = extractedTokens.inputTokens > 0 || extractedTokens.outputTokens > 0;
+            }
+
+            // Try streaming extraction if no tokens found
+            if (!tokensFound) {
+              const streamingTokens = extractTokensFromStreaming(responseData);
+              if (streamingTokens) {
+                inputTokens = streamingTokens.inputTokens;
+                outputTokens = streamingTokens.outputTokens;
+                tokensFound = true;
+              }
+            }
+          }
+
+          // Log and update tracker
+          if (tokensFound) {
+            console.log(`[TOKEN-TRACKING] Session ${sessionId}: ${inputTokens} input, ${outputTokens} output tokens`);
+            realTimeTokenTracker.addTokenData(sessionId, inputTokens, outputTokens);
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Error in response interceptor:', error);
+    }
+
+    return originalSend.call(this, data);
+  };
+
+  // Add onRequest hook to set up connection pooling and circuit breaker for /v1/messages
   server.app.addHook('onRequest', async (request, reply) => {
     if (request.url === '/v1/messages' && request.method === 'POST') {
       try {
+        // Extract provider and model from request
+        const body = request.body as any;
+        let provider = 'unknown';
+        let model = 'unknown';
+
+        if (body?.model) {
+          if (typeof body.model === 'string' && body.model.includes(',')) {
+            [provider, model] = body.model.split(',');
+          } else {
+            model = body.model;
+          }
+        }
+
+        // Check circuit breaker before processing request
+        const circuitBreaker = circuitBreakerManager.getCircuitBreaker(provider, model);
+        const status = circuitBreaker.getStatus();
+
+        if (!status.isHealthy) {
+          reply.status(503).send({
+            error: {
+              type: 'provider_unavailable',
+              message: `Provider ${provider}${model ? `/${model}` : ''} is currently unavailable`,
+              code: 'CIRCUIT_BREAKER_OPEN'
+            }
+          });
+          return;
+        }
+
         // Set up connection pool context for this request
-        const { provider, sessionId } = connectionManager.parseRequestInfo(request);
+        const { provider: poolProvider, sessionId } = connectionManager.parseRequestInfo(request);
         (request as any).__connectionPoolContext = {
           provider,
           sessionId,
@@ -533,6 +628,288 @@ export const createServer = (config: any): Server => {
     } catch (error) {
       console.error("Failed to optimize session affinity:", error);
       reply.status(500).send({ error: "Failed to optimize session affinity" });
+    }
+  });
+
+  // Historical Analytics API Endpoints
+  server.app.get("/api/metrics/historical", async (req, reply) => {
+    try {
+      const query = req.query as any;
+      const hours = parseInt(query.hours) || 24;
+      const provider = query.provider;
+      const model = query.model;
+
+      const historicalData = metricsCollector.getHistoricalAnalytics({
+        hours,
+        provider,
+        model
+      });
+
+      return {
+        success: true,
+        data: historicalData,
+        query: { hours, provider, model }
+      };
+    } catch (error) {
+      console.error("Failed to get historical metrics:", error);
+      reply.status(500).send({ error: "Failed to get historical metrics" });
+    }
+  });
+
+  server.app.get("/api/metrics/cost-analytics", async (req, reply) => {
+    try {
+      const query = req.query as any;
+      const days = parseInt(query.days) || 30;
+
+      const costAnalytics = metricsCollector.getCostAnalytics(days);
+
+      return {
+        success: true,
+        data: costAnalytics,
+        period: `${days} days`
+      };
+    } catch (error) {
+      console.error("Failed to get cost analytics:", error);
+      reply.status(500).send({ error: "Failed to get cost analytics" });
+    }
+  });
+
+  server.app.get("/api/metrics/top-models", async (req, reply) => {
+    try {
+      const query = req.query as any;
+      const limit = parseInt(query.limit) || 10;
+
+      const topModels = metricsCollector.getTopModels(limit);
+
+      return {
+        success: true,
+        data: topModels,
+        limit
+      };
+    } catch (error) {
+      console.error("Failed to get top models:", error);
+      reply.status(500).send({ error: "Failed to get top models" });
+    }
+  });
+
+  server.app.get("/api/metrics/database-stats", async (req, reply) => {
+    try {
+      const stats = metricsCollector.getDatabaseStats();
+
+      return {
+        success: true,
+        data: stats
+      };
+    } catch (error) {
+      console.error("Failed to get database stats:", error);
+      reply.status(500).send({ error: "Failed to get database stats" });
+    }
+  });
+
+  server.app.post("/api/metrics/flush", async (req, reply) => {
+    try {
+      metricsCollector.flushAllData();
+
+      return {
+        success: true,
+        message: "All pending metrics data flushed to database"
+      };
+    } catch (error) {
+      console.error("Failed to flush metrics:", error);
+      reply.status(500).send({ error: "Failed to flush metrics" });
+    }
+  });
+
+  // Prometheus Metrics Endpoint
+  server.app.get("/metrics", async (req, reply) => {
+    try {
+      const format = (req.query as any).format || 'prometheus';
+      const metrics = req.query as any;
+
+      if (format === 'opentelemetry' || metrics.format === 'opentelemetry') {
+        // OpenTelemetry format
+        const otelMetrics = prometheusExporter.generateOpenTelemetryMetrics();
+        reply.header('Content-Type', 'application/json');
+        reply.header('X-Content-Type-Options', 'nosniff');
+        return otelMetrics;
+      } else {
+        // Prometheus text format (default)
+        const prometheusMetrics = prometheusExporter.generateMetricsText();
+        reply.header('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+        reply.header('X-Content-Type-Options', 'nosniff');
+        reply.header('Cache-Control', 'no-cache, no-store, must-revalidate');
+        return prometheusMetrics;
+      }
+    } catch (error) {
+      console.error("Failed to generate metrics:", error);
+      reply.status(500).send({ error: "Failed to generate metrics" });
+    }
+  });
+
+  // Alerting Management Endpoints
+  server.app.get("/api/alerts/rules", async (req, reply) => {
+    try {
+      const rules = alertingManager.getRules();
+      return { success: true, data: rules };
+    } catch (error) {
+      console.error("Failed to get alert rules:", error);
+      reply.status(500).send({ error: "Failed to get alert rules" });
+    }
+  });
+
+  server.app.post("/api/alerts/rules", async (req, reply) => {
+    try {
+      const ruleData = req.body;
+      const rule = alertingManager.createRule(ruleData);
+      return { success: true, data: rule };
+    } catch (error) {
+      console.error("Failed to create alert rule:", error);
+      reply.status(500).send({ error: "Failed to create alert rule" });
+    }
+  });
+
+  server.app.put("/api/alerts/rules/:id", async (req, reply) => {
+    try {
+      const ruleId = (req.params as any).id;
+      const updates = req.body;
+      const success = alertingManager.updateRule(ruleId, updates);
+
+      if (!success) {
+        reply.status(404).send({ error: "Alert rule not found" });
+        return;
+      }
+
+      return { success: true, message: "Alert rule updated" };
+    } catch (error) {
+      console.error("Failed to update alert rule:", error);
+      reply.status(500).send({ error: "Failed to update alert rule" });
+    }
+  });
+
+  server.app.delete("/api/alerts/rules/:id", async (req, reply) => {
+    try {
+      const ruleId = (req.params as any).id;
+      const success = alertingManager.deleteRule(ruleId);
+
+      if (!success) {
+        reply.status(404).send({ error: "Alert rule not found" });
+        return;
+      }
+
+      return { success: true, message: "Alert rule deleted" };
+    } catch (error) {
+      console.error("Failed to delete alert rule:", error);
+      reply.status(500).send({ error: "Failed to delete alert rule" });
+    }
+  });
+
+  server.app.get("/api/alerts/active", async (req, reply) => {
+    try {
+      const alerts = alertingManager.getActiveAlerts();
+      return { success: true, data: alerts };
+    } catch (error) {
+      console.error("Failed to get active alerts:", error);
+      reply.status(500).send({ error: "Failed to get active alerts" });
+    }
+  });
+
+  server.app.get("/api/alerts/history", async (req, reply) => {
+    try {
+      const limit = parseInt((req.query as any).limit) || 100;
+      const history = alertingManager.getAlertHistory(limit);
+      return { success: true, data: history };
+    } catch (error) {
+      console.error("Failed to get alert history:", error);
+      reply.status(500).send({ error: "Failed to get alert history" });
+    }
+  });
+
+  server.app.post("/api/alerts/resolve/:id", async (req, reply) => {
+    try {
+      const alertId = (req.params as any).id;
+      const reason = (req.body as any)?.reason || 'Manual resolution';
+      alertingManager.resolveAlert(alertId, reason);
+      return { success: true, message: "Alert resolved" };
+    } catch (error) {
+      console.error("Failed to resolve alert:", error);
+      reply.status(500).send({ error: "Failed to resolve alert" });
+    }
+  });
+
+  server.app.get("/api/alerts/statistics", async (req, reply) => {
+    try {
+      const stats = alertingManager.getStatistics();
+      return { success: true, data: stats };
+    } catch (error) {
+      console.error("Failed to get alerting statistics:", error);
+      reply.status(500).send({ error: "Failed to get alerting statistics" });
+    }
+  });
+
+  // Circuit Breaker Management Endpoints
+  server.app.get("/api/circuit-breaker/status", async (req, reply) => {
+    try {
+      const statuses = circuitBreakerManager.getAllStatuses();
+      const healthSummary = circuitBreakerManager.getHealthSummary();
+
+      return {
+        success: true,
+        data: {
+          statuses,
+          summary: healthSummary
+        }
+      };
+    } catch (error) {
+      console.error("Failed to get circuit breaker status:", error);
+      reply.status(500).send({ error: "Failed to get circuit breaker status" });
+    }
+  });
+
+  server.app.post("/api/circuit-breaker/reset", async (req, reply) => {
+    try {
+      const body = req.body as any;
+      const { provider, model } = body || {};
+
+      if (provider) {
+        const breaker = circuitBreakerManager.getCircuitBreaker(provider, model);
+        breaker.reset();
+        return {
+          success: true,
+          message: `Circuit breaker reset for ${provider}${model ? `/${model}` : ''}`
+        };
+      } else {
+        circuitBreakerManager.resetAll();
+        return {
+          success: true,
+          message: "All circuit breakers reset"
+        };
+      }
+    } catch (error) {
+      console.error("Failed to reset circuit breaker:", error);
+      reply.status(500).send({ error: "Failed to reset circuit breaker" });
+    }
+  });
+
+  server.app.post("/api/circuit-breaker/force-open", async (req, reply) => {
+    try {
+      const body = req.body as any;
+      const { provider, model } = body || {};
+
+      if (!provider) {
+        reply.status(400).send({ error: "Provider is required" });
+        return;
+      }
+
+      const breaker = circuitBreakerManager.getCircuitBreaker(provider, model);
+      breaker.forceOpen();
+
+      return {
+        success: true,
+        message: `Circuit breaker forced OPEN for ${provider}${model ? `/${model}` : ''}`
+      };
+    } catch (error) {
+      console.error("Failed to force open circuit breaker:", error);
+      reply.status(500).send({ error: "Failed to force open circuit breaker" });
     }
   });
 

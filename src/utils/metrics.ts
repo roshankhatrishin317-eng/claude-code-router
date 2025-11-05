@@ -1,5 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { realTimeTokenTracker } from './realTimeTokenTracker';
+import { systemHealthMonitor } from './systemHealth';
+import { metricsDatabase } from './metricsDatabase';
 
 export interface RequestMetrics {
   timestamp: number;
@@ -11,6 +13,48 @@ export interface RequestMetrics {
   duration: number;
   success: boolean;
   errorType?: string;
+  statusCode?: number;
+  ipAddress?: string;
+  userAgent?: string;
+  firstTokenLatency?: number;
+  streamingEfficiency?: number;
+}
+
+export interface LatencyPercentiles {
+  p50: number;
+  p90: number;
+  p95: number;
+  p99: number;
+  p999: number;
+  average: number;
+  min: number;
+  max: number;
+}
+
+export interface StatusCodeDistribution {
+  '2xx_success': number;
+  '3xx_redirect': number;
+  '4xx_client_error': number;
+  '5xx_server_error': number;
+  errorTypes: {
+    '400_bad_request': number;
+    '401_unauthorized': number;
+    '403_forbidden': number;
+    '429_rate_limited': number;
+    '500_server_error': number;
+    '502_bad_gateway': number;
+    '503_unavailable': number;
+  };
+}
+
+export interface SystemHealthSummary {
+  status: 'healthy' | 'warning' | 'critical';
+  cpuUsage: number;
+  memoryUsage: number;
+  heapUsage: number;
+  eventLoopDelay: number;
+  score: number;
+  issues: string[];
 }
 
 export interface RealTimeMetrics {
@@ -22,10 +66,13 @@ export interface RealTimeMetrics {
   totalRequests: number;
   errorRate: number;
   averageLatency: number;
+  latencyPercentiles: LatencyPercentiles;
   inputTokensPerMinute: number;
   outputTokensPerMinute: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+  statusCodeDistribution: StatusCodeDistribution;
+  systemHealth: SystemHealthSummary;
 }
 
 export interface TokenCosts {
@@ -85,10 +132,12 @@ export class MetricsCollector extends EventEmitter {
   private providerMetrics: Map<string, ProviderMetrics> = new Map();
   private lastMinuteRequests: RequestMetrics[] = [];
   private lastSecondTokens: { tokens: number; inputTokens: number; outputTokens: number; timestamp: number }[] = [];
-
+  private pendingPersists: RequestMetrics[] = [];
   private readonly MAX_HISTORY_SIZE = 10000;
   private readonly ONE_MINUTE = 60 * 1000;
   private readonly ONE_SECOND = 1000;
+  private readonly BATCH_SIZE = 100;
+  private readonly BATCH_TIMEOUT = 5000; // 5 seconds
 
   // Default token costs (can be overridden per provider/model)
   private tokenCosts: Map<string, TokenCosts> = new Map([
@@ -115,6 +164,14 @@ export class MetricsCollector extends EventEmitter {
     super();
     // Clean up old data every minute
     setInterval(() => this.cleanupOldData(), 60 * 1000);
+
+    // Start batch persistence
+    setInterval(() => this.flushBatch(), this.BATCH_TIMEOUT);
+
+    // Cleanup database every hour
+    setInterval(() => {
+      metricsDatabase.cleanupOldData(90); // Keep 90 days of data
+    }, 60 * 60 * 1000);
   }
 
   // Method to update token costs for custom providers/models
@@ -162,8 +219,31 @@ export class MetricsCollector extends EventEmitter {
       timestamp: metrics.timestamp
     });
 
+    // Add to batch for persistence
+    this.pendingPersists.push(metrics);
+
+    // Flush batch if it's full
+    if (this.pendingPersists.length >= this.BATCH_SIZE) {
+      this.flushBatch();
+    }
+
     // Emit event for real-time updates
     this.emit('metricsUpdated', this.getRealTimeMetrics());
+  }
+
+  /**
+   * Flush pending metrics to database
+   */
+  private flushBatch(): void {
+    if (this.pendingPersists.length === 0) return;
+
+    try {
+      metricsDatabase.insertRequestsBatch(this.pendingPersists);
+      this.pendingPersists = [];
+    } catch (error) {
+      console.error('Error persisting metrics to database:', error);
+      // Keep the data in memory for retry
+    }
   }
 
   private updateSessionMetrics(metrics: RequestMetrics): void {
@@ -298,11 +378,17 @@ export class MetricsCollector extends EventEmitter {
       ? (recentErrors / this.lastMinuteRequests.length) * 100
       : 0;
 
+    // Calculate latency percentiles
+    const latencyPercentiles = this.calculateLatencyPercentiles(this.lastMinuteRequests.map(req => req.duration));
+
+    // Calculate status code distribution
+    const statusCodeDistribution = this.calculateStatusCodeDistribution(this.lastMinuteRequests);
+
+    // Get system health summary
+    const systemHealth = systemHealthMonitor.getHealthStatus();
+
     // Calculate average latency
-    const recentLatencies = this.lastMinuteRequests.map(req => req.duration);
-    const averageLatency = recentLatencies.length > 0
-      ? recentLatencies.reduce((sum, lat) => sum + lat, 0) / recentLatencies.length
-      : 0;
+    const averageLatency = latencyPercentiles.average;
 
     return {
       requestsPerMinute: rpm,
@@ -313,10 +399,13 @@ export class MetricsCollector extends EventEmitter {
       totalRequests: this.requestHistory.length,
       errorRate: Math.round(errorRate * 100) / 100,
       averageLatency: Math.round(averageLatency),
+      latencyPercentiles,
       inputTokensPerMinute,
       outputTokensPerMinute,
       totalInputTokens,
-      totalOutputTokens
+      totalOutputTokens,
+      statusCodeDistribution,
+      systemHealth
     };
   }
 
@@ -445,6 +534,138 @@ export class MetricsCollector extends EventEmitter {
       uptime: process.uptime(),
       tokenAnalytics
     };
+  }
+
+  /**
+   * Get historical analytics from database
+   */
+  getHistoricalAnalytics(query: {
+    startTime?: number;
+    endTime?: number;
+    provider?: string;
+    model?: string;
+    hours?: number;
+  }) {
+    const historicalQuery = {
+      startTime: query.startTime || (Date.now() - (query.hours || 24) * 60 * 60 * 1000),
+      endTime: query.endTime,
+      provider: query.provider,
+      model: query.model,
+      limit: 100
+    };
+
+    return metricsDatabase.queryHistoricalMetrics(historicalQuery);
+  }
+
+  /**
+   * Get database statistics
+   */
+  getDatabaseStats() {
+    return metricsDatabase.getDatabaseStats();
+  }
+
+  /**
+   * Get cost analytics
+   */
+  getCostAnalytics(days: number = 30) {
+    return metricsDatabase.getCostAnalytics(days);
+  }
+
+  /**
+   * Get top models from database
+   */
+  getTopModels(limit: number = 10) {
+    return metricsDatabase.getTopModels(limit);
+  }
+
+  /**
+   * Force flush any pending data to database
+   */
+  flushAllData(): void {
+    this.flushBatch();
+    console.log('All metrics data flushed to database');
+  }
+
+  /**
+   * Calculate latency percentiles using quickselect algorithm
+   */
+  private calculateLatencyPercentiles(latencies: number[]): LatencyPercentiles {
+    if (latencies.length === 0) {
+      return { p50: 0, p90: 0, p95: 0, p99: 0, p999: 0, average: 0, min: 0, max: 0 };
+    }
+
+    const sorted = [...latencies].sort((a, b) => a - b);
+    const n = sorted.length;
+
+    const average = sorted.reduce((sum, val) => sum + val, 0) / n;
+    const min = sorted[0];
+    const max = sorted[n - 1];
+
+    // Helper function to get percentile
+    const percentile = (arr: number[], p: number): number => {
+      if (arr.length === 0) return 0;
+      const index = Math.ceil((p / 100) * arr.length) - 1;
+      return arr[Math.max(0, Math.min(index, arr.length - 1))];
+    };
+
+    return {
+      p50: Math.round(percentile(sorted, 50)),
+      p90: Math.round(percentile(sorted, 90)),
+      p95: Math.round(percentile(sorted, 95)),
+      p99: Math.round(percentile(sorted, 99)),
+      p999: Math.round(percentile(sorted, 99.9)),
+      average: Math.round(average),
+      min: Math.round(min),
+      max: Math.round(max)
+    };
+  }
+
+  /**
+   * Calculate status code distribution
+   */
+  private calculateStatusCodeDistribution(requests: RequestMetrics[]): StatusCodeDistribution {
+    const distribution: StatusCodeDistribution = {
+      '2xx_success': 0,
+      '3xx_redirect': 0,
+      '4xx_client_error': 0,
+      '5xx_server_error': 0,
+      errorTypes: {
+        '400_bad_request': 0,
+        '401_unauthorized': 0,
+        '403_forbidden': 0,
+        '429_rate_limited': 0,
+        '500_server_error': 0,
+        '502_bad_gateway': 0,
+        '503_unavailable': 0
+      }
+    };
+
+    for (const req of requests) {
+      const statusCode = req.statusCode || (req.success ? 200 : 500);
+
+      if (statusCode >= 200 && statusCode < 300) {
+        distribution['2xx_success']++;
+      } else if (statusCode >= 300 && statusCode < 400) {
+        distribution['3xx_redirect']++;
+      } else if (statusCode >= 400 && statusCode < 500) {
+        distribution['4xx_client_error']++;
+        switch (statusCode) {
+          case 400: distribution.errorTypes['400_bad_request']++; break;
+          case 401: distribution.errorTypes['401_unauthorized']++; break;
+          case 403: distribution.errorTypes['403_forbidden']++; break;
+          case 429: distribution.errorTypes['429_rate_limited']++; break;
+        }
+      } else if (statusCode >= 500 && statusCode < 600) {
+        distribution['5xx_server_error']++;
+        switch (statusCode) {
+          case 500: distribution.errorTypes['500_server_error']++; break;
+          case 502: distribution.errorTypes['502_bad_gateway']++; break;
+          case 503: distribution.errorTypes['503_unavailable']++; break;
+        }
+      }
+    }
+
+    return distribution;
   }
 }
 

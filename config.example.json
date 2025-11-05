@@ -1,0 +1,227 @@
+{
+  "LOG": false,
+  "LOG_LEVEL": "debug",
+  "CLAUDE_PATH": "",
+  "HOST": "127.0.0.1",
+  "PORT": 3456,
+  "APIKEY": "",
+  "API_TIMEOUT_MS": "600000",
+  "PROXY_URL": "",
+  "transformers": [],
+
+  // ===== ENHANCED MONITORING (Simple Setup) =====
+  "Monitoring": {
+    "enabled": true,
+    "persistence": {
+      "enabled": true,
+      "type": "sqlite",
+      "retentionDays": 30,
+      "batchSize": 100
+    },
+    "prometheus": {
+      "enabled": true,
+      "path": "/metrics"
+    }
+  },
+
+  // ===== CIRCUIT BREAKER PROTECTION =====
+  "CircuitBreaker": {
+    "enabled": true,
+    "defaults": {
+      "failureThreshold": 5,
+      "successThreshold": 3,
+      "timeout": 60000,
+      "monitoringPeriod": 300000,
+      "resetTimeout": 300000
+    }
+  },
+
+  // ===== SYSTEM HEALTH MONITORING =====
+  "SystemHealth": {
+    "enabled": true,
+    "monitoringInterval": 2000
+  },
+
+  // ===== BASIC ALERTING =====
+  "Alerting": {
+    "enabled": true,
+    "evaluationInterval": 30000,
+    "channels": {
+      "console": {
+        "enabled": true
+      }
+    },
+    "rules": [
+      {
+        "name": "High Error Rate",
+        "enabled": true,
+        "severity": "critical",
+        "metric": {
+          "type": "metric",
+          "name": "error_rate",
+          "source": "metrics"
+        },
+        "condition": {
+          "operator": "gt",
+          "threshold": 10
+        },
+        "duration": 300000,
+        "cooldown": 900000,
+        "channels": ["console"]
+      },
+      {
+        "name": "High Latency",
+        "enabled": true,
+        "severity": "warning",
+        "metric": {
+          "type": "metric",
+          "name": "average_latency",
+          "source": "metrics"
+        },
+        "condition": {
+          "operator": "gt",
+          "threshold": 5000
+        },
+        "duration": 600000,
+        "cooldown": 1800000,
+        "channels": ["console"]
+      }
+    ]
+  },
+
+  // ===== SIMPLE COST TRACKING =====
+  "CostManagement": {
+    "enabled": true,
+    "budgetAlerts": {
+      "enabled": true,
+      "thresholds": {
+        "daily": 10,
+        "weekly": 50,
+        "monthly": 200
+      }
+    },
+    "pricing": {
+      "iflow": {
+        "glm-4.6": { "input": 0.001, "output": 0.002 },
+        "qwen3-coder-plus": { "input": 0.001, "output": 0.002 },
+        "kimi-k2-0905": { "input": 0.001, "output": 0.002 }
+      },
+      "Nvidia": {
+        "qwen/qwen3-coder-480b-a35b-instruct": { "input": 0.0005, "output": 0.001 },
+        "deepseek-ai/deepseek-v3.1-terminus": { "input": 0.00014, "output": 0.00028 }
+      },
+      "zlm": {
+        "glm-4.6": { "input": 0.001, "output": 0.002 },
+        "glm-4.5": { "input": 0.001, "output": 0.002 }
+      }
+    }
+  },
+
+  // ===== ENHANCED PROVIDERS =====
+  "Providers": [
+    {
+      "name": "iflow",
+      "api_base_url": "https://apis.iflow.cn/v1/chat/completions",
+      "api_key": "YOUR_IFLOW_API_KEY_HERE",
+      "models": [
+        "qwen3-coder-plus",
+        "kimi-k2-0905",
+        "glm-4.5",
+        "glm-4.6",
+        "qwen3-max",
+        "deepseek-v3.1",
+        "qwen3-vl-plus"
+      ],
+      "transformer": {
+        "deepseek-v3.1": {
+          "use": [
+            [
+              "maxtoken",
+              {
+                "max_tokens": 8192
+              }
+            ]
+          ]
+        }
+      },
+      // New monitoring settings
+      "rateLimitPerMinute": 60,
+      "maxConnections": 10,
+      "timeout": 30000,
+      "costTracking": true,
+      "monitoring": {
+        "enabled": true,
+        "trackLatency": true,
+        "trackTokens": true,
+        "trackErrors": true
+      }
+    },
+    {
+      "name": "Nvidia",
+      "api_base_url": "https://integrate.api.nvidia.com/v1/chat/completions",
+      "api_key": "YOUR_NVIDIA_API_KEY_HERE",
+      "models": [
+        "qwen/qwen3-coder-480b-a35b-instruct",
+        "deepseek-ai/deepseek-v3.1-terminus"
+      ],
+      "rateLimitPerMinute": 100,
+      "maxConnections": 5,
+      "timeout": 60000,
+      "costTracking": true,
+      "monitoring": {
+        "enabled": true,
+        "trackLatency": true,
+        "trackTokens": true,
+        "trackErrors": true
+      }
+    },
+    {
+      "name": "zlm",
+      "api_base_url": "https://api.z.ai/api/coding/paas/v4",
+      "api_key": "YOUR_ZLM_API_KEY_HERE",
+      "models": [
+        "glm-4.6",
+        "glm-4.5"
+      ],
+      "rateLimitPerMinute": 80,
+      "maxConnections": 8,
+      "timeout": 45000,
+      "costTracking": true,
+      "monitoring": {
+        "enabled": true,
+        "trackLatency": true,
+        "trackTokens": true,
+        "trackErrors": true
+      }
+    }
+  ],
+
+  // ===== ROUTER CONFIGURATION =====
+  "Router": {
+    "default": "iflow,glm-4.6",
+    "background": "",
+    "think": "",
+    "longContext": "Nvidia,qwen/qwen3-coder-480b-a35b-instruct",
+    "longContextThreshold": 60000,
+    "webSearch": "",
+    "image": ""
+  },
+
+  "CUSTOM_ROUTER_PATH": "",
+
+  // ===== OPTIONAL: SIMPLE AUTH (if needed) =====
+  "Authentication": {
+    "enabled": false,
+    "enableApiKeyAuth": true,
+    "enableJwtAuth": false,
+    "defaultUserRole": "user",
+    "rateLimitPerMinute": 100,
+    "monthlyTokenBudget": 1000000
+  },
+
+  // ===== OPTIONAL: STATUS LINE =====
+  "StatusLine": {
+    "enabled": false,
+    "currentStyle": "default"
+  }
+}
