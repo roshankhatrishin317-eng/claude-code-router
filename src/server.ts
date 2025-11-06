@@ -125,71 +125,32 @@ export const createServer = (config: any): Server => {
   // Register cache response middleware
   server.app.addHook('onResponse', cacheResponseMiddleware);
 
-  // Monkey-patch the response send method to capture tokens
-  // This is necessary because @musistudio/llms intercepts responses internally
-  if (server.app.raw && server.app.raw.send) {
-    const originalSend = server.app.raw.send;
-    server.app.raw.send = function(data: any) {
-      try {
-        console.log(`[RAW-SEND] Intercepting response`);
-
-        // Parse response data
-        let responseData = data;
-        if (typeof data === 'string') {
-          try {
-            responseData = JSON.parse(data);
-          } catch (e) {
-            // Not JSON
-          }
-        }
-
-        // Extract session ID from current request context
-        const request = (this as any).request;
-        if (request && request.url && request.url.startsWith('/v1/') && request.method === 'POST') {
-          const metricsContext = (request as any).__metricsContext;
-          if (metricsContext?.sessionId) {
-            const { sessionId } = metricsContext;
-
-            // Extract tokens
-            let inputTokens = 0;
-            let outputTokens = 0;
-            let tokensFound = false;
-
-            if (responseData) {
-              const extractedTokens = extractTokensFromResponse(responseData);
-              if (extractedTokens) {
-                inputTokens = extractedTokens.inputTokens;
-                outputTokens = extractedTokens.outputTokens;
-                tokensFound = extractedTokens.inputTokens > 0 || extractedTokens.outputTokens > 0;
-              }
-
-              // Try streaming extraction if no tokens found
-              if (!tokensFound) {
-                const streamingTokens = extractTokensFromStreaming(responseData);
-                if (streamingTokens) {
-                  inputTokens = streamingTokens.inputTokens;
-                  outputTokens = streamingTokens.outputTokens;
-                  tokensFound = true;
-                }
-              }
-            }
-
-            // Log and update tracker
-            if (tokensFound) {
-              console.log(`[TOKEN-TRACKING] Session ${sessionId}: ${inputTokens} input, ${outputTokens} output tokens`);
-              realTimeTokenTracker.addTokenData(sessionId, inputTokens, outputTokens);
-            }
-          }
-        }
-      } catch (error) {
-        console.error('Error in response interceptor:', error);
+  // Intercept responses at Fastify level to capture response data
+  server.app.addHook('onSend', async (request, reply, payload) => {
+    try {
+      if (!request.url.startsWith('/v1/') || request.method !== 'POST') {
+        return payload;
       }
 
-      return originalSend.call(this, data);
-    };
-  } else {
-    console.log(`[TOKEN-TRACKING] Warning: server.app.raw is not available, token tracking will be limited`);
-  }
+      // Parse and store response data for metrics collection
+      let responseData = payload;
+      if (typeof payload === 'string') {
+        try {
+          responseData = JSON.parse(payload);
+        } catch (e) {
+          // Not JSON, keep as string
+        }
+      }
+
+      // Store on request for collectResponseMetrics to access
+      (request as any).__responseData = responseData;
+
+    } catch (error) {
+      console.error('[RESPONSE-INTERCEPT] Error:', error);
+    }
+
+    return payload;
+  });
 
   // Add onRequest hook to set up connection pooling and circuit breaker for /v1/messages
   server.app.addHook('onRequest', async (request, reply) => {
